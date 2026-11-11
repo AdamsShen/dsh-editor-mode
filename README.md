@@ -53,7 +53,7 @@ install_bundle(target="/absolute/path/to/dsh-editor-mode")
 |---|---|---|
 | `runtimeDir` | `~/.dsh/editor-runtime` | code-server 安装目录 |
 | `upstreamHost` | `127.0.0.1` | 回环监听地址 |
-| `upstreamPort` | `3999` | 回环端口（1..65535） |
+| `upstreamPort` | `3999` | 首选回环端口（1..65535）；被占用时自动探测后续空闲端口 |
 | `nodeBin` | `''` | 指定 node 可执行文件；留空自动探测 |
 | `workspaceDir` | `''` | 打开的项目目录；留空回退到 `~/dsh-editor-mode` |
 
@@ -62,6 +62,17 @@ install_bundle(target="/absolute/path/to/dsh-editor-mode")
 **刷新 GUI 页面**（client 是静态 bundle，HMR 不会自动推给已连接页面），
 然后点右上角的「编辑器」或左侧栏的「编辑器」图标；点「Agents」或「返回 Agents」回到对话。
 
+编辑器工具栏：
+
+| 按钮 | 作用 |
+|---|---|
+| **打开目录** | 调用 DSH 的目录选择器选项目目录；只改 iframe 的 `?folder=` 参数，**无需重启** code-server |
+| **重载** | 强制重建 iframe |
+| **返回 Agents** | 回到 DSH 对话 |
+
+标题栏会显示当前打开的目录路径。端口在配置值被占用时会自动向后探测空闲端口
+（`[配置值, 配置值+20)`），实际地址通过 `/editor-status` 返回给 Client，无需手动改配置。
+
 ## 已知边界
 
 - **iframe 直连回环**，非同源反代：code-server 的 WebSocket 走多条动态路径，而 DSH
@@ -69,6 +80,8 @@ install_bundle(target="/absolute/path/to/dsh-editor-mode")
 - 跨 origin 由 `--trusted-origins '*'` + `--auth none` 放行，仅监听 `127.0.0.1`。
 - 无 Config schema、无运行时自动下载/校验、无崩溃自动重启、无编辑器↔Agent 消息桥。
 - 全局快捷键、下载、扩展 webview 在 iframe 内可能有损耗。
+- 右侧可见的 **Chat 面板来自 code-server 自带功能**，不是 DSH 的 Agents 会话；
+  两者联动（选中代码发给 Agent、Agent 改文件回显）属于后续阶段。
 
 ## 许可
 

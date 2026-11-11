@@ -120,12 +120,14 @@ window.__ModuleLoader__.load({
     }
 
     // ---- 全屏编辑器面板 ----
-    // iframe 无条件挂载：status fetch 只用于取真实 upstream 地址与项目路径，
+    // iframe 无条件挂载：status fetch 只用于取真实 upstream 地址与默认项目路径，
     // 绝不门控渲染（跨域 / 鉴权 / 时序任一失败都不该留下一整块白屏）。
-    function EditorPanel({ layout }) {
+    // 打开其它项目目录用 code-server 的 ?folder= 参数，无需重启上游进程。
+    function EditorPanel({ layout, uiWorkspace }) {
       const [nonce, setNonce] = useState(0);
       const [loaded, setLoaded] = useState(false);
-      const [info, setInfo] = useState(null);   // { upstream, workspace, status } | null
+      const [info, setInfo] = useState(null);   // { upstream, workspace, folder, status } | null
+      const [folder, setFolder] = useState('');  // 当前打开的目录；空 = 用 Host 默认值
 
       useEffect(() => {
         let alive = true;
@@ -135,20 +137,32 @@ window.__ModuleLoader__.load({
             const r = await fetch('/editor-status', { signal: ctrl.signal });
             if (!r.ok) return;
             const j = await r.json();
-            if (alive && j?.upstream) setInfo(j);
+            if (alive && j?.upstream) {
+              setInfo(j);
+              // 只在用户还没手动选过目录时采用 Host 默认目录。
+              setFolder((prev) => prev || j.folder || '');
+            }
           } catch { /* 保留兜底地址，不影响 iframe */ }
         })();
         return () => { alive = false; ctrl.abort(); };
       }, [nonce]);
 
       const reload = useCallback(() => { setLoaded(false); setNonce((n) => n + 1); }, []);
-      // 显式带 ?folder=：code-server 会打开插件配置的项目目录，
+
+      // 「打开目录」：调用 DSH 的目录选择器，之后只改 iframe 的 ?folder= 参数。
+      const openDirectory = useCallback(async () => {
+        try {
+          const picked = await uiWorkspace?.pickDirectory?.();
+          if (picked) { setLoaded(false); setFolder(picked); setNonce((n) => n + 1); }
+        } catch { /* 用户取消或选择器不可用，保持现状 */ }
+      }, [uiWorkspace]);
+
+      // 显式带 ?folder=：code-server 会打开该目录，
       // 也避免它自己 302 到 ./?folder=... 时丢掉工作区。
       // 重新加载靠 key={nonce} 强制卸载/重建 iframe。
       const base = (info?.upstream || FALLBACK_EDITOR_URL).replace(/\/?$/, '/');
-      const folder = info?.folder || '';
       const src = folder ? `${base}?folder=${encodeURIComponent(folder)}` : base;
-      const label = info?.workspace || 'VS Code';
+      const label = folder || info?.workspace || 'VS Code';
 
       return h('div', { className: 'dem-panel' },
         h(Style, null),
@@ -156,6 +170,10 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dem-title' }, '编辑器'),
           h('span', { className: 'dem-sub' }, label),
           h('span', { className: 'dem-spacer' }),
+          h('button', {
+            className: 'dem-btn', type: 'button', title: '打开其它项目目录',
+            onClick: openDirectory,
+          }, '打开目录'),
           h('button', {
             className: 'dem-btn', type: 'button', title: '重新加载编辑器', onClick: reload,
           }, '重载'),
@@ -201,7 +219,10 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('main', () => ctx.slots.register({
           name: 'main',
           key: PANEL_ID,
-          inject: () => ({ layout: ctx.layout }),
+          inject: () => ({
+            layout: ctx.layout,
+            uiWorkspace: ctx.uiWorkspace || ctx.get?.('uiWorkspace'),
+          }),
         }, EditorPanel));
       },
     };

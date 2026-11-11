@@ -18,7 +18,7 @@
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { existsSync } from 'node:fs';
-import { connect as netConnect } from 'node:net';
+import { createServer as createNetServer, connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -72,19 +72,44 @@ function findNode() {
 }
 
 /**
- * 启动 code-server。返回 { stop }；失败时抛错，由 apply 转成可展示的状态。
+ * 探测端口是否可绑定。返回 true 表示空闲。
+ * 只做一次短监听后立即关闭，不与真正启动的上游竞争（存在极小竞态窗口，
+ * 但 code-server 启动失败会写进 log 并通过 status 暴露，不会静默）。
+ */
+async function portFree(port, host) {
+  return new Promise((resolveFree) => {
+    const srv = createNetServer();
+    srv.once('error', () => resolveFree(false));
+    srv.listen(port, host, () => srv.close(() => resolveFree(true)));
+  });
+}
+
+/**
+ * 选一个可用端口：优先配置值，被占用时在 [配置值, 配置值+20) 内找空闲端口。
+ * 这样多开 DSH 或残留进程时不会 EADDRINUSE 起不来。
+ */
+async function pickPort(configured, host) {
+  const base = Number(configured) || 3999;
+  for (let p = base; p < base + 20; p++) {
+    if (await portFree(p, host)) return p;
+  }
+  return base; // 全占用时仍回退，让 code-server 自己报错并写进 log
+}
+
+/**
+ * 启动 code-server。返回 { child, state }；失败时抛错，由 apply 转成可展示的状态。
  * 说明：本机 DSH 自带 node 带 hardened runtime，会拒绝加载 argon2 的第三方签名原生模块，
- * 因此 PoC 固定用系统 node + FORCE_NODE_VERSION=24 绕过版本门禁（已实测可启动）。
+ * 因此固定用系统 node + FORCE_NODE_VERSION=24 绕过版本门禁（已实测可启动）。
  * 生产版应改自带兼容 node 或重签原生模块。
  */
-function startServer(config, ctx) {
+async function startServer(config, ctx) {
   const runtimeDir = expand(config.runtimeDir || '~/.dsh/editor-runtime');
   const entry = findEntry(runtimeDir);
   if (!entry) throw new Error(`code-server 未安装：在 ${runtimeDir} 下找不到 out/node/entry.js`);
 
   const nodeBin = expand(config.nodeBin || '') || findNode();
-  const port = Number(config.upstreamPort) || 3999;
   const host = config.upstreamHost || '127.0.0.1';
+  const port = await pickPort(config.upstreamPort, host);
   const workspace = expand(config.workspaceDir || '') || resolve(homedir(), 'dsh-editor-mode');
 
   const args = [
@@ -291,7 +316,7 @@ export function apply(ctx, config = {}) {
   // 启动上游。
   const boot = (async () => {
     try {
-      runtime = startServer(config, ctx);
+      runtime = await startServer(config, ctx);
       state0.status = 'starting';
       const ok = await waitReady(runtime.state, runtime.child);
       runtime.state.status = ok ? 'ready' : 'degraded';
