@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Editor mode",
+    "description": "Switch between the Agents conversation and an embedded VS Code editor from the top-right corner."
+  }
+}

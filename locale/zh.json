@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "编辑器模式",
+    "description": "在右上角一键切换 Agents 对话与内置 VS Code 编辑器，编辑器可直接打开当前项目目录。"
+  }
+}

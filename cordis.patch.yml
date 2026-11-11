@@ -1,0 +1,14 @@
+- insert:
+    - id: editor-mode
+      name: '@local/dsh-editor-mode'
+      config:
+        # code-server 运行时目录。默认使用 ~/.dsh/editor-runtime（由 PoC 预置）。
+        # 生产版本应改为插件自管下载/校验；见交付报告的风险项。
+        runtimeDir: '~/.dsh/editor-runtime'
+        # code-server 监听的回环地址；仅本机可达，DSH 通过 /editor/ 前缀反代。
+        upstreamHost: '127.0.0.1'
+        upstreamPort: 3999
+        # 传给 code-server 的启动参数。
+        nodeBin: ''
+        # 打开的项目目录。留空则回退到当前 Session 的 workingDirectory。
+        workspaceDir: ''
