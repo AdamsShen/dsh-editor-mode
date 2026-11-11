@@ -119,6 +119,32 @@ window.__ModuleLoader__.load({
         h('path', { d: 'M8 13l-2 2 2 2M16 13l2 2-2 2' }));
     }
 
+    // ---- 编辑器 → Agents 选区桥 ----
+    // 隐藏的 dock 占位：它注册在 session 作用域的 conversation.input.dock 槽，
+    // 因此 inject(sessionId) 能拿到该 Session 的 conversation.input facade，
+    // 进而把 VS Code 选区写进 Agents 输入框。渲染为 null，不占任何空间。
+    const BRIDGE_EVENT = 'dsh-editor:selection';
+
+    function BridgeDock({ getInput }) {
+      useEffect(() => {
+        const onSelection = (event) => {
+          const detail = event.detail;
+          if (!detail?.text) return;
+          const input = getInput?.();
+          if (!input) return;
+          try {
+            // 追加到现有草稿，而不是覆盖用户已输入的内容。
+            const current = input.state?.getSnapshot?.()?.draft ?? '';
+            const next = current ? `${current}\n${detail.text}` : detail.text;
+            input.setDraft(next);
+          } catch { /* phase 非 plain 时忽略，不打断用户 */ }
+        };
+        window.addEventListener(BRIDGE_EVENT, onSelection);
+        return () => window.removeEventListener(BRIDGE_EVENT, onSelection);
+      }, [getInput]);
+      return null;
+    }
+
     // ---- 全屏编辑器面板 ----
     // iframe 无条件挂载：status fetch 只用于取真实 upstream 地址与默认项目路径，
     // 绝不门控渲染（跨域 / 鉴权 / 时序任一失败都不该留下一整块白屏）。
@@ -224,6 +250,39 @@ window.__ModuleLoader__.load({
             uiWorkspace: ctx.uiWorkspace || ctx.get?.('uiWorkspace'),
           }),
         }, EditorPanel));
+
+        // 选区注入桥：session 作用域，能拿到 conversation.input facade。
+        ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+          name: 'conversation.input.dock',
+          id: `${NS}#bridge`,
+          order: 90,
+          label: () => 'DSH 编辑器选区桥',
+          inject: (sessionId) => {
+            const actx = ctx.sessions?.scope?.(sessionId);
+            const conversation = actx?.get?.('conversation');
+            const input = conversation?.input?.for?.(actx);
+            return { getInput: () => input };
+          },
+        }, BridgeDock));
+
+        // 轮询 Host 的待发送选区队列：扩展 POST → Host 缓存 → 这里取走。
+        // 取到后切回 Agents 并派发事件，由 BridgeDock 注入输入框。
+        const poll = async () => {
+          try {
+            const r = await fetch('/editor-bridge/pending', { cache: 'no-store' });
+            if (!r.ok) return;
+            const { items } = await r.json();
+            if (!Array.isArray(items) || items.length === 0) return;
+            try { ctx.layout?.selectPanel(null); } catch { /* 保持现状 */ }
+            for (const item of items) {
+              window.dispatchEvent(new CustomEvent(BRIDGE_EVENT, {
+                detail: { file: item.file, line: item.line, text: item.text },
+              }));
+            }
+          } catch { /* 暂时不可达时跳过，下一轮再试 */ }
+        };
+        const timer = setInterval(poll, 1500);
+        ctx.effect(() => () => clearInterval(timer));
       },
     };
   },

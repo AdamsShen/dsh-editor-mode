@@ -1,0 +1,35 @@
+{
+  "name": "dsh-editor-bridge",
+  "displayName": "DSH Editor Bridge",
+  "description": "把当前文件与选区发送给 DSH Agents 对话",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:dshEditorBridge.sendSelection",
+    "onCommand:dshEditorBridge.sendFile"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "dshEditorBridge.sendSelection",
+        "title": "发送给 DSH Agents（当前选区）"
+      },
+      {
+        "command": "dshEditorBridge.sendFile",
+        "title": "发送给 DSH Agents（当前文件）"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "dshEditorBridge.sendSelection",
+          "group": "navigation@99"
+        }
+      ]
+    }
+  }
+}

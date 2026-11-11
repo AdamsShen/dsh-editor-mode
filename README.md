@@ -13,8 +13,9 @@ DSH（DeepSeek Harness）编辑器模式插件：安装后在右上角切换 **A
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半边：拉起并托管 code-server 子进程、`/editor-status` 状态端点、`/editor/*` 反代占位、进程组清理 |
-| `client.js` | Client 半边：`main` 全屏面板（key=`editor`）、`sidebar.panellist` 入口图标、`conversation.session.header.utilities` 右上角分段控件 |
+| `index.js` | Host 半边：拉起并托管 code-server 子进程、`/editor-status` 状态端点、`/editor-bridge/*` 选区桥、`/editor/*` 反代占位、进程组清理、端口自动探测 |
+| `client.js` | Client 半边：`main` 全屏面板（key=`editor`）、侧栏图标、右上角分段控件、选区轮询与输入框注入 |
+| `extensions/local.dsh-editor-bridge-0.1.0/` | 随包发布的 VS Code 扩展：把当前文件/选区 POST 到 DSH 桥接端点 |
 | `cordis.patch.yml` | Loader patch，插入 `editor-mode` 行并声明 config |
 | `package.json` | bundle 清单 + `dsh.client` 声明 |
 | `locale/*.json` | 中英文展示元数据 |
@@ -56,6 +57,7 @@ install_bundle(target="/absolute/path/to/dsh-editor-mode")
 | `upstreamPort` | `3999` | 首选回环端口（1..65535）；被占用时自动探测后续空闲端口 |
 | `nodeBin` | `''` | 指定 node 可执行文件；留空自动探测 |
 | `workspaceDir` | `''` | 打开的项目目录；留空回退到 `~/dsh-editor-mode` |
+| `bridgeToken` | `''` | 选区桥 token；留空每次启动随机生成（一般无需配置） |
 
 ### 4. 使用
 
@@ -73,6 +75,21 @@ install_bundle(target="/absolute/path/to/dsh-editor-mode")
 标题栏会显示当前打开的目录路径。端口在配置值被占用时会自动向后探测空闲端口
 （`[配置值, 配置值+20)`），实际地址通过 `/editor-status` 返回给 Client，无需手动改配置。
 
+### 5. 编辑器 → Agents 联动（最小版）
+
+随包的 VS Code 扩展通过 `--extensions-dir` 自动加载，提供两个命令
+（命令面板 / 编辑器右键菜单）：
+
+| 命令 | 作用 |
+|---|---|
+| **发送给 DSH Agents（当前选区）** | 把当前文件路径、行号和选中代码送进 DSH Agents 输入框 |
+| **发送给 DSH Agents（当前文件）** | 只发送文件路径引用 |
+
+链路：`扩展 POST /editor-bridge/push` → Host 有界队列 → Client 每 1.5s 轮询
+`/editor-bridge/pending` → 自动切回 Agents 模式 → 追加到输入框草稿。
+扩展通过环境变量 `DSH_BRIDGE_URL` / `DSH_BRIDGE_TOKEN` 获知端点与一次性 token；
+push 端点只接受回环请求，防止同机其它进程注入。
+
 ## 已知边界
 
 - **iframe 直连回环**，非同源反代：code-server 的 WebSocket 走多条动态路径，而 DSH
@@ -80,8 +97,10 @@ install_bundle(target="/absolute/path/to/dsh-editor-mode")
 - 跨 origin 由 `--trusted-origins '*'` + `--auth none` 放行，仅监听 `127.0.0.1`。
 - 无 Config schema、无运行时自动下载/校验、无崩溃自动重启、无编辑器↔Agent 消息桥。
 - 全局快捷键、下载、扩展 webview 在 iframe 内可能有损耗。
-- 右侧可见的 **Chat 面板来自 code-server 自带功能**，不是 DSH 的 Agents 会话；
-  两者联动（选中代码发给 Agent、Agent 改文件回显）属于后续阶段。
+- 右侧可见的 **Chat 面板来自 code-server 自带功能**，不是 DSH 的 Agents 会话。
+- 联动目前是**单向**（编辑器 → Agents 输入框）且用轮询；反向（Agent 改文件后在编辑器高亮、
+  选中即问的内联体验）尚未实现。
+- 输入框注入依赖 `conversation.input` facade 的 `setDraft`，若 DSH 升级改动该契约需同步适配。
 
 ## 许可
 

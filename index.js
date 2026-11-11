@@ -20,8 +20,12 @@ import { request as httpRequest } from 'node:http';
 import { existsSync } from 'node:fs';
 import { createServer as createNetServer, connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
+
+/** 本插件包目录（用于定位随包发布的 VS Code 扩展）。 */
+const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
 
 const EDITOR_PREFIX = '/editor/';
 const EDITOR_WS_PATH = '/editor/';
@@ -102,7 +106,7 @@ async function pickPort(configured, host) {
  * 因此固定用系统 node + FORCE_NODE_VERSION=24 绕过版本门禁（已实测可启动）。
  * 生产版应改自带兼容 node 或重签原生模块。
  */
-async function startServer(config, ctx) {
+async function startServer(config, ctx, bridge) {
   const runtimeDir = expand(config.runtimeDir || '~/.dsh/editor-runtime');
   const entry = findEntry(runtimeDir);
   if (!entry) throw new Error(`code-server 未安装：在 ${runtimeDir} 下找不到 out/node/entry.js`);
@@ -119,10 +123,18 @@ async function startServer(config, ctx) {
     '--disable-telemetry',
     '--disable-update-check',
     '--trusted-origins', '*',
+    '--extensions-dir', join(PACKAGE_DIR, 'extensions'),
     workspace,
   ];
 
-  const env = { ...process.env, FORCE_NODE_VERSION: '24' };
+  // 把桥接参数通过环境传给 code-server 的扩展主机（扩展用 process.env 读取）。
+  // URL 指向 DSH 自身的 /editor-bridge/push，不是 code-server 自身。
+  const env = {
+    ...process.env,
+    FORCE_NODE_VERSION: '24',
+    DSH_BRIDGE_TOKEN: bridge?.token || '',
+    DSH_BRIDGE_URL: bridge?.pushUrl || '',
+  };
   const child = spawn(nodeBin, args, {
     cwd: runtimeDir,
     env,
@@ -269,6 +281,20 @@ export function apply(ctx, config = {}) {
   const state0 = { status: 'starting', upstream: '', workspace: '', log: '' };
   let runtime = null;
 
+  // 「编辑器 → DSH Agents」选区桥：有界队列，避免无限堆积。
+  // VS Code 扩展（Node 扩展主机）POST 进来，Client 轮询取走。
+  const bridgeQueue = [];
+  const BRIDGE_MAX = 20;
+  const BRIDGE_TEXT_MAX = 8000;
+  // 默认每次启动随机；config.bridgeToken 可注入固定值（便于测试/多实例共享）。
+  const bridgeToken = config.bridgeToken || randomBytes(16).toString('hex');
+
+  /** 只接受回环请求：扩展跑在本机 code-server 扩展主机里。 */
+  const bridgeAllowed = (req) => {
+    const addr = req.socket?.remoteAddress || '';
+    return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+  };
+
   // 以 status 端点暴露 PoC 状态，便于验证与排障。
   ctx.effect(() => webServer.register({
     kind: 'exact',
@@ -289,6 +315,55 @@ export function apply(ctx, config = {}) {
       }));
     },
   }), 'editor-mode: GET /editor-status');
+
+  // 扩展 → Host：提交选区。用 token 防止同机其它进程随意注入。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/editor-bridge/push',
+    handler: async (req, res) => {
+      if (!bridgeAllowed(req)) { res.writeHead(403); res.end(); return; }
+      if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+      try {
+        const chunks = [];
+        for await (const c of req) {
+          chunks.push(c);
+          if (chunks.reduce((n, b) => n + b.length, 0) > BRIDGE_TEXT_MAX * 2) {
+            res.writeHead(413); res.end(); return;
+          }
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (body?.token !== bridgeToken) { res.writeHead(401); res.end(); return; }
+        const text = String(body.text ?? '').slice(0, BRIDGE_TEXT_MAX);
+        if (text.trim()) {
+          bridgeQueue.push({
+            file: String(body.file ?? '').slice(0, 500),
+            line: Number(body.line) || 0,
+            text,
+            at: Date.now(),
+          });
+          if (bridgeQueue.length > BRIDGE_MAX) bridgeQueue.shift();
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400); res.end();
+      }
+    },
+  }), 'editor-mode: POST /editor-bridge/push');
+
+  // Client → Host：轮询并清空待发送选区（同源，走常规鉴权）。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/editor-bridge/pending',
+    handler: (req, res) => {
+      if (rejected(ctx, req, res)) return;
+      const items = bridgeQueue.splice(0, bridgeQueue.length);
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('cache-control', 'no-store');
+      res.end(JSON.stringify({ items }));
+    },
+  }), 'editor-mode: GET /editor-bridge/pending');
 
   // 主反代路由：所有 /editor/ 下的 HTTP 请求。
   ctx.effect(() => webServer.register({
@@ -316,7 +391,12 @@ export function apply(ctx, config = {}) {
   // 启动上游。
   const boot = (async () => {
     try {
-      runtime = await startServer(config, ctx);
+      let pushUrl = '';
+      try {
+        const origin = ctx.get('webServer')?.getOrigin?.();
+        if (origin) pushUrl = `${origin}/editor-bridge/push`;
+      } catch { /* webServer 尚未就绪时留空，扩展会降级 */ }
+      runtime = await startServer(config, ctx, { token: bridgeToken, pushUrl });
       state0.status = 'starting';
       const ok = await waitReady(runtime.state, runtime.child);
       runtime.state.status = ok ? 'ready' : 'degraded';
