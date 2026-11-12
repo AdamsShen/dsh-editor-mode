@@ -134,12 +134,16 @@ async function pickPort(configured, host) {
  */
 function ensureEditorSettings(userDataDir, config) {
   const defaults = {
-    // 关掉 Copilot 及其 Chat 入口，避免出现要求登录的“Build with Agent”面板。
+    // 内置 Copilot 由 VSCODE_SKIP_BUILTIN_EXTENSIONS 在扫描阶段就排除了；
+    // 这里再关一次 AI 特性，避免核心聊天视图（右侧次级侧栏）因为
+    // "chat 扩展被禁用" 而留一个空壳面板 —— 我们的 DSH Chat 要占这个位置。
+    'chat.disableAIFeatures': true,
     'github.copilot.enable': false,
     'chat.commandCenter.enabled': false,
     'chat.agent.enabled': false,
     'workbench.startupEditor': 'none',
-    // 隐藏与 DSH 重复的入口，保持编辑器聚焦。
+    // 右侧次级侧栏默认收起：用户点 DSH Chat 或「打开 Agents 风格布局」时再展开，
+    // 免得每次打开编辑器都多一栏空白。
     'workbench.secondarySideBar.defaultVisibility': 'hidden',
     ...(config.editorSettings || {}),
   };

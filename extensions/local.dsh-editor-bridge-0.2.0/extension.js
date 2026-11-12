@@ -242,6 +242,8 @@ class ChatViewProvider {
     this.context = context;
     this.hooks = hooks;
     this.view = null;
+    /** 最近一次可见的宿主视图 id（activitybar 或 secondarySidebar 各一个宿主）。 */
+    this.visibleId = '';
     this.mediaRoot = vscode.Uri.joinPath(context.extensionUri, 'media');
     /** chat.html 的磁盘绝对路径（读模板用，不走 webview URI）。 */
     this.mediaDir = path.join(context.extensionUri.fsPath, 'media');
@@ -297,12 +299,24 @@ class ChatViewProvider {
     });
   }
 
+  /**
+   * 当前真正可见的那个视图 id。
+   *
+   * 同一个视图 id 同时挂在 activitybar 与 secondarySidebar 两个容器上，
+   * resolveWebviewView 会被调用两次（两个宿主各一次），只有可见的那个在
+   * 用；聚焦命令需要知道是哪一边，否则会把用户没在看的侧栏也展开。
+   */
+  visibleViewId() {
+    return this.visibleId || '';
+  }
+
   post(message) {
     try { this.view?.webview.postMessage(message); } catch { /* 视图已销毁 */ }
   }
 
   resolveWebviewView(webviewView) {
     this.view = webviewView;
+    this.visibleId = webviewView.viewType || VIEW_ID;
     const webview = webviewView.webview;
     webview.options = {
       enableScripts: true,
@@ -326,8 +340,17 @@ class ChatViewProvider {
     webview.html = html;
 
     webview.onDidReceiveMessage((message) => { void this.onMessage(message); });
-    webviewView.onDidChangeVisibility(() => { if (webviewView.visible) this.postState(); });
-    webviewView.onDidDispose(() => { this.view = null; });
+    const trackVisibility = (visible) => {
+      if (!visible) return;
+      this.visibleId = webviewView.viewType || VIEW_ID;
+      this.postState();
+    };
+    trackVisibility(webviewView.visible !== false);
+    webviewView.onDidChangeVisibility(() => { trackVisibility(webviewView.visible); });
+    webviewView.onDidDispose(() => {
+      if (this.view === webviewView) this.view = null;
+      if (this.visibleId === (webviewView.viewType || VIEW_ID)) this.visibleId = '';
+    });
 
     // 模型目录是异步的，先给 UI 一个空态，拿到后补发。
     this.postState();
@@ -662,8 +685,11 @@ function activate(context) {
       provider.reset();
       void vscode.commands.executeCommand('dshEditor.chat.focus');
     }),
+    // 两个容器（左侧活动栏 + 右侧次级侧栏）挂的是同一个视图 id，
+    // 没有显式容器时 executeCommand 会把右侧那栏一起掀出来，所以先按可见性挑一个。
     vscode.commands.registerCommand('dshEditorBridge.focusChat', () => {
-      void vscode.commands.executeCommand('dshEditor.chat.focus');
+      const id = provider.visibleViewId() || VIEW_ID;
+      void vscode.commands.executeCommand(`${id}.focus`);
     }),
   );
 

@@ -24,10 +24,25 @@
           "title": "DSH",
           "icon": "media/icon.svg"
         }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "dshEditorSecondary",
+          "title": "DSH",
+          "icon": "media/icon.svg"
+        }
       ]
     },
     "views": {
       "dshEditor": [
+        {
+          "id": "dshEditor.chat",
+          "type": "webview",
+          "name": "DSH Chat",
+          "contextualTitle": "DSH Chat"
+        }
+      ],
+      "dshEditorSecondary": [
         {
           "id": "dshEditor.chat",
           "type": "webview",
@@ -81,6 +96,12 @@
           "command": "dshEditorBridge.newChat",
           "when": "view == dshEditor.chat",
           "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "dshEditorBridge.focusChat",
+          "when": "true"
         }
       ]
     }

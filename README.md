@@ -55,6 +55,7 @@ npm install code-server@4.145.2
 | `userDataDir` | `~/.dsh/editor-runtime/user-data` | code-server 独立 user-data-dir（不污染全局配置） |
 | `editorSettings` | `{}` | 覆盖写入编辑器的默认设置 |
 | `skipBuiltinExtensions` | `['GitHub.copilot-chat']` | 不加载的内置扩展；设成 `[]` 可恢复 code-server 默认行为 |
+| `editorSettings`（继续） | — | 默认写入 `chat.disableAIFeatures: true`，防止核心聊天视图留下空壳 |
 
 ## 三块能力
 
@@ -74,8 +75,14 @@ npm install code-server@4.145.2
 
 ### 二、编辑器侧栏 Chat（用 DSH 的模型）
 
-编辑器左侧活动栏多一个 **DSH** 图标，点开就是对话侧栏 —— 和 Cursor / CodeBuddy 的形态一致
-（`viewsContainers.activitybar` + `type: webview` 视图，不碰 workbench）。
+编辑器里多一个 **DSH Chat** 视图，两个入口都指向同一份对话：
+
+- **左侧活动栏** DSH 图标（`viewsContainers.activitybar`）
+- **右侧次级侧栏** DSH 图标（`viewsContainers.secondarySidebar`）—— 就是原先被 GitHub Copilot Chat
+  占掉的那块位置，现在由 DSH Chat 接管
+
+形态与 Cursor / CodeBuddy 一致（`type: webview` 视图，不碰 workbench 源码）。同一视图 id 挂两个容器时，
+VS Code 各给一个宿主实例；点「打开 DSH Chat」命令会优先聚焦当前可见的那一侧，不会平白把另一侧也展开。
 
 **模型来源**：`/editor-chat/models` 读的是 DSH 自己的适配器注册表与
 `agentDefaultModel.currentSelection()`，所以下拉里就是你在 DSH 设置里配的那套

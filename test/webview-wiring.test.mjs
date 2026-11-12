@@ -48,6 +48,23 @@ for (const file of ['chat.html', 'chat.css', 'chat.js', 'markdown.js', 'icon.svg
 check('icon.svg 被 manifest 引用',
   JSON.stringify(manifest.contributes.viewsContainers).includes('media/icon.svg'));
 
+console.log('右侧次级侧栏容器');
+{
+  const containers = manifest.contributes.viewsContainers || {};
+  check('声明了 secondarySidebar 容器',
+    Array.isArray(containers.secondarySidebar) && containers.secondarySidebar.length === 1,
+    JSON.stringify(containers.secondarySidebar));
+  const secondaryId = containers.secondarySidebar?.[0]?.id;
+  const viewsInSecondary = (manifest.contributes.views || {})[secondaryId] || [];
+  check('右侧容器里挂着 DSH Chat 视图',
+    viewsInSecondary.some((v) => v.id === 'dshEditor.chat' && v.type === 'webview'),
+    JSON.stringify(viewsInSecondary));
+  const viewsInActivity = (manifest.contributes.views || {}).dshEditor || [];
+  check('左侧结构保留（同一视图 id）',
+    viewsInActivity.some((v) => v.id === 'dshEditor.chat'));
+  check('两个容器的图标都存在', secondaryId && containers.secondarySidebar[0].icon);
+}
+
 console.log('manifest 与代码一致');
 const viewIdInCode = /const VIEW_ID = '([^']+)'/.exec(extensionSrc)?.[1];
 const viewIdInManifest = manifest.contributes.views.dshEditor?.[0]?.id;
