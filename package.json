@@ -1,9 +1,12 @@
 {
   "name": "@local/dsh-editor-mode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "DSH 编辑器模式：右上角一键在 Agents 对话与内置 VS Code 编辑器之间切换",
+  "scripts": {
+    "test": "node test/run-all.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -19,7 +22,9 @@
     "extensions/**"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [

@@ -8,16 +8,19 @@
  *     iframe 直连回环（因为 code-server 的 WS 走多条动态路径，DSH registerUpgrade
  *     只支持 exact path），同源反代留到后续阶段统一处理全部 upgrade 路径。
  *  4. 用 ctx.connection.requestRejection 做 Host/Origin 围栏 + 浏览器鉴权。
+ *  5. 编辑器内 Chat 的后端：/editor-chat/{models,send,abort}，直接走 ctx.llm，
+ *     复用用户在 DSH 里配置的模型与凭据（不新增任何模型配置）。
  *
  * 边界（当前阶段有意不做）：
  *  - 不自带运行时下载/校验，使用 config.runtimeDir 指向已安装目录；
  *  - 不做多实例复用、崩溃自动重启、优雅停机之外的清理；
- *  - 不做编辑器←→Agent 的消息桥（那是后续联动阶段）。
+ *  - 编辑器内 Chat 是「纯模型对话」，不给模型任何工具（不读文件、不执行命令）。
+ *    需要真正动手改代码时，走「发送到 Agents」交回 DSH Agent。
  */
 
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer as createNetServer, connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
@@ -29,6 +32,23 @@ const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
 
 const EDITOR_PREFIX = '/editor/';
 const EDITOR_WS_PATH = '/editor/';
+
+/** 编辑器内 Chat 的三个端点（均为回环 + token，供 code-server 扩展主机调用）。 */
+const CHAT_MODELS_PATH = '/editor-chat/models';
+const CHAT_SEND_PATH = '/editor-chat/send';
+const CHAT_ABORT_PATH = '/editor-chat/abort';
+const CHAT_BODY_MAX = 512 * 1024;
+/** 送给模型的历史上限：消息条数。超出时从最旧的开始丢，保留最近上下文。 */
+const CHAT_MAX_MESSAGES = 40;
+/** 单条选区注入正文上限，避免把整个大文件塞进 prompt。 */
+const CHAT_CONTEXT_MAX = 12000;
+
+/** 生成 provider 中立的消息 id（adapter 只读 role/content/source，id 仅需唯一）。 */
+let messageSeq = 0;
+function nextMessageId() {
+  messageSeq += 1;
+  return `dem-${Date.now().toString(36)}-${messageSeq}`;
+}
 
 /** 把 `~/...` 展开成绝对路径；其余保持原样。 */
 function expand(p) {
@@ -101,6 +121,45 @@ async function pickPort(configured, host) {
 }
 
 /**
+ * 写入编辑器默认设置（幂等）。
+ *
+ * 目的：code-server 发行包内置了 GitHub Copilot Chat
+ * （product.json 的 builtInExtensionsEnabledWithAutoUpdates），默认会在编辑器里
+ * 出现一个要求登录 GitHub Copilot 的 Chat 面板 —— 那与 DSH 的模型配置无关，
+ * 混在一起会让用户误以为「编辑器没用自己的模型」。这里把它关掉，让编辑器只做编辑器，
+ * 与 DSH Agents 的协作走我们自己的桥接通道。
+ *
+ * 只写我们自己的 user-data-dir，不碰用户的全局 code-server 配置。
+ * 合并策略：保留用户已有键，只补齐缺失的默认值（用户手动改过的不覆盖）。
+ */
+function ensureEditorSettings(userDataDir, config) {
+  const defaults = {
+    // 关掉 Copilot 及其 Chat 入口，避免出现要求登录的“Build with Agent”面板。
+    'github.copilot.enable': false,
+    'chat.commandCenter.enabled': false,
+    'chat.agent.enabled': false,
+    'workbench.startupEditor': 'none',
+    // 隐藏与 DSH 重复的入口，保持编辑器聚焦。
+    'workbench.secondarySideBar.defaultVisibility': 'hidden',
+    ...(config.editorSettings || {}),
+  };
+  try {
+    const dir = join(userDataDir, 'User');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'settings.json');
+    let current = {};
+    if (existsSync(file)) {
+      try { current = JSON.parse(readFileSync(file, 'utf8')); } catch { current = {}; }
+    }
+    let changed = false;
+    for (const [k, v] of Object.entries(defaults)) {
+      if (!(k in current)) { current[k] = v; changed = true; }
+    }
+    if (changed || !existsSync(file)) writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`);
+  } catch { /* 设置写入失败不应阻止编辑器启动 */ }
+}
+
+/**
  * 启动 code-server。返回 { child, state }；失败时抛错，由 apply 转成可展示的状态。
  * 说明：本机 DSH 自带 node 带 hardened runtime，会拒绝加载 argon2 的第三方签名原生模块，
  * 因此固定用系统 node + FORCE_NODE_VERSION=24 绕过版本门禁（已实测可启动）。
@@ -116,6 +175,10 @@ async function startServer(config, ctx, bridge) {
   const port = await pickPort(config.upstreamPort, host);
   const workspace = expand(config.workspaceDir || '') || resolve(homedir(), 'dsh-editor-mode');
 
+  // 独立 user-data-dir：不污染用户全局 code-server 配置，也让默认设置可复现。
+  const userDataDir = expand(config.userDataDir || '') || join(homedir(), '.dsh', 'editor-runtime', 'user-data');
+  ensureEditorSettings(userDataDir, config);
+
   const args = [
     entry,
     '--bind-addr', `${host}:${port}`,
@@ -124,16 +187,20 @@ async function startServer(config, ctx, bridge) {
     '--disable-update-check',
     '--trusted-origins', '*',
     '--extensions-dir', join(PACKAGE_DIR, 'extensions'),
+    '--user-data-dir', userDataDir,
     workspace,
   ];
 
   // 把桥接参数通过环境传给 code-server 的扩展主机（扩展用 process.env 读取）。
-  // URL 指向 DSH 自身的 /editor-bridge/push，不是 code-server 自身。
+  // URL 指向 DSH 自身的 /editor-bridge/push 与 /editor-chat/*，不是 code-server 自身。
   const env = {
     ...process.env,
     FORCE_NODE_VERSION: '24',
     DSH_BRIDGE_TOKEN: bridge?.token || '',
     DSH_BRIDGE_URL: bridge?.pushUrl || '',
+    // 编辑器内 Chat 用的基址 + token；留空时扩展会回退读 runtimeDir/bridge.json。
+    DSH_EDITOR_BASE: bridge?.base || '',
+    DSH_EDITOR_TOKEN: bridge?.token || '',
   };
   const child = spawn(nodeBin, args, {
     cwd: runtimeDir,
@@ -267,6 +334,166 @@ function proxyUpgrade(ctx, state, req, socket, head) {
   socket.on('close', () => up.destroy());
 }
 
+/**
+ * 本机服务自身的基址。DSH 只暴露 host/port 两个 getter（没有 getOrigin），
+ * 监听 0.0.0.0 时回环访问要用 127.0.0.1。拿不到端口时返回空串，调用方降级。
+ */
+function selfBase(webServer) {
+  const host = webServer?.host === '0.0.0.0' ? '127.0.0.1' : (webServer?.host || '127.0.0.1');
+  const port = Number(webServer?.port) || 0;
+  return port ? `http://${host}:${port}` : '';
+}
+
+/** 把 {base, token} 落到运行时目录：扩展主机在 DSH 重启、env 丢失时按此文件兜底。 */
+function writeBridgeFile(runtimeDir, info) {
+  try {
+    mkdirSync(runtimeDir, { recursive: true });
+    const file = join(runtimeDir, 'bridge.json');
+    writeFileSync(file, `${JSON.stringify(info, null, 2)}\n`, { mode: 0o600 });
+    return file;
+  } catch {
+    return '';
+  }
+}
+
+/** 只接受回环来源：编辑器扩展跑在本机 code-server 的扩展主机里。 */
+function loopbackOnly(req) {
+  const addr = req.socket?.remoteAddress || '';
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+/** 从请求头或查询串取 token（GET 用头，便于 SSE 前的普通 fetch 复用同一份代码）。 */
+function tokenFromRequest(req, url) {
+  const header = req.headers['x-dsh-editor-token'];
+  if (typeof header === 'string' && header) return header;
+  return url.searchParams.get('token') || '';
+}
+
+/** 读一个受长度限制的 JSON 请求体；超限返回 null 并由调用方回 413。 */
+async function readJsonBody(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) return { tooLarge: true };
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return { value: {} };
+  try {
+    return { value: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+  } catch {
+    return { invalid: true };
+  }
+}
+
+/**
+ * 列出「DSH 里当前可用的模型」。
+ *
+ * 只读 llm 适配器注册表 + agentDefaultModel 的当前选择，不读任何插件私有配置，
+ * 因此编辑器里看到的就是用户在 DSH 设置里配好的那套（含自定义 provider）。
+ */
+async function describeModels(ctx) {
+  const llm = ctx.get('llm');
+  if (!llm) return { default: null, providers: [], error: '当前 DSH 未挂载 llm 服务' };
+
+  let infos = [];
+  try { infos = llm.listProviders() || []; } catch { infos = []; }
+
+  const providers = [];
+  for (const p of infos) {
+    const entry = { id: p.id, name: p.name || p.id, models: [] };
+    try {
+      const list = await llm.listModels(p.id);
+      entry.models = (list || []).map((m) => ({
+        id: m.id,
+        name: m.name || m.id,
+        contextWindow: m?.context?.contextWindow ?? null,
+      }));
+    } catch { /* 该 provider 目录不可用时只暴露 provider 本身 */ }
+    providers.push(entry);
+  }
+
+  // 默认值优先取用户在 DSH 里选定的模型；取不到再退到第一个可用模型。
+  let sel = null;
+  try {
+    const s = ctx.get('agentDefaultModel')?.currentSelection?.();
+    if (s?.provider && s?.model) {
+      sel = { provider: s.provider, model: s.model, reasoningEffort: s.reasoningEffort ?? null };
+    }
+  } catch { /* 未配置默认模型 */ }
+  if (!sel) {
+    const first = providers.find((p) => p.models.length) || providers[0];
+    if (first) sel = { provider: first.id, model: first.models[0]?.id ?? '', reasoningEffort: null };
+  }
+  return { default: sel, providers };
+}
+
+/** 组装 system 提示：默认是「纯模型对话」的边界说明，附当前项目目录。 */
+function composeSystem(base, context) {
+  const fallback = [
+    '你是 DSH 编辑器（内置 VS Code）里的编程助手，复用用户已在 DSH 配置的模型。',
+    '回答用中文，直接、具体、可执行；涉及代码时给最小可用的片段，不要长篇铺陈。',
+    '你看不到用户工作区的文件，只能依据对话里粘贴的代码与上下文作答；',
+    '信息不足时明确说要哪个文件的哪一段。你无法修改文件、执行命令或访问网络，',
+    '需要真正动手改动时，提示用户用「发送到 Agents」把需求交给 DSH Agent。',
+  ].join('');
+  const lines = [base || fallback];
+  if (context?.folder) lines.push(`当前项目目录：${context.folder}`);
+  return lines.join('\n\n');
+}
+
+/** 把编辑器上下文（当前文件/选区）追加到最后一条用户消息，而不是伪造额外消息。 */
+function appendContext(messages, context) {
+  if (!context || (!context.file && !context.text)) return messages;
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'user') return messages;
+
+  const parts = [];
+  if (context.file) {
+    parts.push(`当前文件：${context.file}${context.line ? `:${context.line}` : ''}`);
+  }
+  if (context.text) {
+    const lang = String(context.language || '');
+    parts.push(`\`\`\`${lang}\n${String(context.text).slice(0, CHAT_CONTEXT_MAX)}\n\`\`\``);
+  }
+  const prev = String(last.content?.[0]?.text ?? '');
+  const content = [{ type: 'text', text: `${prev}\n\n【编辑器上下文】\n${parts.join('\n')}` }];
+  return [...messages.slice(0, -1), {
+    id: last.id, role: 'user', content, source: last.source,
+  }];
+}
+
+/** 把前端朴素消息转成 llm 需要的 Message（必须带 source，adapter 会读它）。 */
+function composeMessages(raw, provider, model) {
+  const out = [];
+  for (const m of raw) {
+    const text = String(m?.content ?? '').trim();
+    if (!text) continue;
+    const content = [{ type: 'text', text }];
+    if (m?.role === 'assistant') {
+      out.push({ id: nextMessageId(), role: 'assistant', content, source: { kind: 'model', provider, model } });
+    } else {
+      out.push({ id: nextMessageId(), role: 'user', content, source: { kind: 'user' } });
+    }
+  }
+  return out.slice(-CHAT_MAX_MESSAGES);
+}
+
+/**
+ * 一个极小的 SSE 写出器。
+ * 用 SSE 而不是 WebSocket：扩展主机是 Node（无 DOM），SSE 用普通 http 请求即可，
+ * 失败可重试，且不需要 DSH 侧再维护一条长连接路由。
+ */
+function sseWriter(res) {
+  let closed = false;
+  res.on('close', () => { closed = true; });
+  const write = (event, data) => {
+    if (closed || res.writableEnded) return;
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch { closed = true; }
+  };
+  return { write, get closed() { return closed; } };
+}
+
 export function apply(ctx, config = {}) {
   const webServer = ctx.get('webServer');
   if (!webServer) throw new Error('editor-mode 需要 webServer 服务（当前 profile 未挂载）');
@@ -287,7 +514,20 @@ export function apply(ctx, config = {}) {
   const BRIDGE_MAX = 20;
   const BRIDGE_TEXT_MAX = 8000;
   // 默认每次启动随机；config.bridgeToken 可注入固定值（便于测试/多实例共享）。
-  const bridgeToken = config.bridgeToken || randomBytes(16).toString('hex');
+  const bridgeToken = config.bridgeToken
+    || process.env.DSH_EDITOR_BRIDGE_TOKEN
+    || randomBytes(16).toString('hex');
+
+  // 本机基址：扩展主机用它回调 DSH 的桥接与 Chat 端点。
+  const base = selfBase(webServer);
+  // 落一份到运行时目录：DSH 重启后扩展主机按 env → 文件的顺序回退，避免静默失效。
+  const bridgeFile = writeBridgeFile(
+    expand(config.runtimeDir || '~/.dsh/editor-runtime'),
+    { base, token: bridgeToken, updatedAt: Date.now() },
+  );
+
+  // 编辑器内 Chat：进行中的请求（requestId → AbortController），用于「停止生成」。
+  const chatInflight = new Map();
 
   /** 只接受回环请求：扩展跑在本机 code-server 扩展主机里。 */
   const bridgeAllowed = (req) => {
@@ -311,6 +551,9 @@ export function apply(ctx, config = {}) {
         workspace: s.workspace,
         // Client 用它拼 ?folder=，让 code-server 打开插件配置的项目目录。
         folder: s.workspace || '',
+        // 排障用：Chat 是否可用、桥接信息落在哪。
+        chat: Boolean(ctx.get('llm')),
+        bridgeFile,
         log: (s.log || '').slice(-4000),
       }));
     },
@@ -365,6 +608,140 @@ export function apply(ctx, config = {}) {
     },
   }), 'editor-mode: GET /editor-bridge/pending');
 
+  // ---- 编辑器内 Chat：模型目录 ----
+  // 扩展主机启动时/切换模型前调用；返回的是 DSH 里真实注册的 provider 与模型，
+  // 以及 agentDefaultModel 的当前选择（即用户在 DSH 设置里选的那个）。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: CHAT_MODELS_PATH,
+    handler: async (req, res) => {
+      if (!loopbackOnly(req)) { res.writeHead(403); res.end(); return; }
+      const url = new URL(req.url, 'http://localhost');
+      if (tokenFromRequest(req, url) !== bridgeToken) { res.writeHead(401); res.end(); return; }
+      let payload;
+      try {
+        payload = await describeModels(ctx);
+      } catch (err) {
+        payload = { default: null, providers: [], error: String(err?.message || err) };
+      }
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('cache-control', 'no-store');
+      res.end(JSON.stringify(payload));
+    },
+  }), 'editor-mode: GET /editor-chat/models');
+
+  // ---- 编辑器内 Chat：一次对话（SSE 流式） ----
+  // 请求体：{ token, requestId, provider?, model?, system?, messages:[{role,content}], context? }
+  // 响应：text/event-stream，事件 meta / delta / reasoning / usage / finish / error。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: CHAT_SEND_PATH,
+    handler: async (req, res) => {
+      if (!loopbackOnly(req)) { res.writeHead(403); res.end(); return; }
+      if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+
+      const body = await readJsonBody(req, CHAT_BODY_MAX);
+      if (body.tooLarge) { res.writeHead(413); res.end(); return; }
+      if (body.invalid) { res.writeHead(400); res.end(); return; }
+      const input = body.value || {};
+      if (input.token !== bridgeToken) { res.writeHead(401); res.end(); return; }
+
+      const llm = ctx.get('llm');
+      if (!llm) { res.writeHead(503); res.end('llm 服务未挂载'); return; }
+
+      // 模型解析：请求显式指定 → DSH 默认选择 → 第一个可用模型。
+      let provider = String(input.provider || '');
+      let model = String(input.model || '');
+      if (!provider || !model) {
+        try {
+          const s = ctx.get('agentDefaultModel')?.currentSelection?.();
+          if (s?.provider && s?.model) { provider = provider || s.provider; model = model || s.model; }
+        } catch { /* 未配置默认模型 */ }
+      }
+      if (!provider || !model) {
+        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('未指定模型，且 DSH 没有默认模型配置');
+        return;
+      }
+
+      const rawMessages = Array.isArray(input.messages) ? input.messages : [];
+      let messages = composeMessages(rawMessages, provider, model);
+      if (!messages.length) {
+        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('对话内容为空');
+        return;
+      }
+      messages = appendContext(messages, input.context);
+      const system = composeSystem(input.system, input.context);
+
+      const requestId = String(input.requestId || `req-${Date.now().toString(36)}`);
+      const ac = new AbortController();
+      chatInflight.set(requestId, ac);
+      // 客户端断开（扩展侧主动 abort 或进程退出）时立刻停掉上游生成，不浪费 token。
+      req.on('close', () => { try { ac.abort(); } catch { /* 已结束 */ } });
+
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      const sse = sseWriter(res);
+      sse.write('meta', { requestId, provider, model });
+
+      try {
+        for await (const chunk of llm.stream({
+          provider, model, messages, system, signal: ac.signal,
+        })) {
+          if (sse.closed) break;
+          switch (chunk?.type) {
+            case 'text-delta':
+              if (chunk.text) sse.write('delta', { text: chunk.text });
+              break;
+            case 'reasoning-delta':
+              if (chunk.text) sse.write('reasoning', { text: chunk.text });
+              break;
+            case 'usage':
+              sse.write('usage', chunk.usage || {});
+              break;
+            case 'finish':
+              sse.write('finish', {
+                kind: chunk.reason?.kind ?? 'stop',
+                failure: chunk.reason?.failure ?? null,
+              });
+              break;
+            default:
+              // block-start / block-end / tool-call-delta：纯模型对话用不到，忽略。
+              break;
+          }
+        }
+      } catch (err) {
+        sse.write('error', { message: String(err?.message || err) });
+      } finally {
+        chatInflight.delete(requestId);
+        if (!res.writableEnded) res.end();
+      }
+    },
+  }), 'editor-mode: POST /editor-chat/send');
+
+  // ---- 编辑器内 Chat：停止生成 ----
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: CHAT_ABORT_PATH,
+    handler: async (req, res) => {
+      if (!loopbackOnly(req)) { res.writeHead(403); res.end(); return; }
+      if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+      const body = await readJsonBody(req, 8 * 1024);
+      const input = body.value || {};
+      if (input.token !== bridgeToken) { res.writeHead(401); res.end(); return; }
+      const ac = chatInflight.get(String(input.requestId || ''));
+      if (ac) { try { ac.abort(); } catch { /* 已结束 */ } }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, aborted: Boolean(ac) }));
+    },
+  }), 'editor-mode: POST /editor-chat/abort');
+
   // 主反代路由：所有 /editor/ 下的 HTTP 请求。
   ctx.effect(() => webServer.register({
     kind: 'prefix',
@@ -391,12 +768,8 @@ export function apply(ctx, config = {}) {
   // 启动上游。
   const boot = (async () => {
     try {
-      let pushUrl = '';
-      try {
-        const origin = ctx.get('webServer')?.getOrigin?.();
-        if (origin) pushUrl = `${origin}/editor-bridge/push`;
-      } catch { /* webServer 尚未就绪时留空，扩展会降级 */ }
-      runtime = await startServer(config, ctx, { token: bridgeToken, pushUrl });
+      const pushUrl = base ? `${base}/editor-bridge/push` : '';
+      runtime = await startServer(config, ctx, { token: bridgeToken, pushUrl, base });
       state0.status = 'starting';
       const ok = await waitReady(runtime.state, runtime.child);
       runtime.state.status = ok ? 'ready' : 'degraded';
@@ -436,3 +809,17 @@ export function apply(ctx, config = {}) {
 
   return { state: state0, getRuntime: () => runtime };
 }
+
+/**
+ * 仅供测试与排障使用的内部出口（不是对外 API）。
+ * 这些纯函数不做 I/O，单独测试能覆盖掉 Chat 的消息组装/上下文注入逻辑。
+ */
+export const __internals = {
+  composeSystem,
+  appendContext,
+  composeMessages,
+  selfBase,
+  loopbackOnly,
+  CHAT_MAX_MESSAGES,
+  CHAT_CONTEXT_MAX,
+};

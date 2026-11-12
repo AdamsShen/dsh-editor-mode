@@ -1,0 +1,88 @@
+{
+  "name": "dsh-editor-bridge",
+  "displayName": "DSH Editor Bridge",
+  "description": "在 VS Code 侧栏里直接和 DSH 对话（复用 DSH 配置的模型），并把选区发给 DSH Agents",
+  "version": "0.2.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onView:dshEditor.chat",
+    "onCommand:dshEditorBridge.sendSelection",
+    "onCommand:dshEditorBridge.sendFile",
+    "onCommand:dshEditorBridge.askSelection",
+    "onCommand:dshEditorBridge.newChat",
+    "onCommand:dshEditorBridge.focusChat"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dshEditor",
+          "title": "DSH",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dshEditor": [
+        {
+          "id": "dshEditor.chat",
+          "type": "webview",
+          "name": "DSH Chat",
+          "contextualTitle": "DSH Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dshEditorBridge.sendSelection",
+        "title": "发送给 DSH Agents（当前选区）",
+        "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.sendFile",
+        "title": "发送给 DSH Agents（当前文件）",
+        "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.askSelection",
+        "title": "在 DSH Chat 中询问选中代码",
+        "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.newChat",
+        "title": "新对话",
+        "category": "DSH",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dshEditorBridge.focusChat",
+        "title": "打开 DSH Chat",
+        "category": "DSH"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "dshEditorBridge.askSelection",
+          "group": "navigation@98",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "dshEditorBridge.sendSelection",
+          "group": "navigation@99"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "dshEditorBridge.newChat",
+          "when": "view == dshEditor.chat",
+          "group": "navigation@1"
+        }
+      ]
+    }
+  }
+}
