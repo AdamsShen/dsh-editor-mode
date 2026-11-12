@@ -62,6 +62,8 @@ check('此时没有任何路由被注册', routes.size === 0, String(routes.size
 console.log('webServer 就绪后');
 present = { webServer };
 for (const handler of listeners.get('internal/service') || []) handler('webServer');
+// installEditor 是 async（桥接文件探活有网络往返），等它装配完再断言。
+await new Promise((r) => setTimeout(r, 300));
 
 check('/editor-status 已注册', routes.has('exact:/editor-status'), [...routes.keys()].join(','));
 check('/editor-chat/send 已注册', routes.has('exact:/editor-chat/send'));
@@ -86,6 +88,36 @@ console.log('兜底路径：不发事件、只让服务出现');
   services2 = { webServer: ws2 };
   await new Promise((r) => setTimeout(r, 400));
   check('轮询兜底：服务出现后自动装配', routes2.has('/editor-status'), [...routes2.keys()].join(','));
+}
+
+console.log('多实例：已有存活实例时不覆盖 bridge.json');
+{
+  const { readFileSync, writeFileSync: write } = await import('node:fs');
+  const dir = join(tmp, 'multi');
+  const { mkdirSync } = await import('node:fs');
+  mkdirSync(dir, { recursive: true });
+  // 造一个「已有实例」的记录，指向一个真实存活的端口（用测试自己的 webServer 桩不行，
+  // 这里起一个最小 HTTP 服务模拟活着的实例）。
+  const probe = (await import('node:http')).createServer((_req, res) => { res.writeHead(401); res.end(); });
+  await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+  const livePort = probe.address().port;
+  const file = join(dir, 'bridge.json');
+  write(file, JSON.stringify({ base: `http://127.0.0.1:${livePort}`, token: 'owner-token' }));
+
+  const routes3 = new Map();
+  const ws3 = { host: '127.0.0.1', port: 46200, register: (r) => { routes3.set(r.path, r); return () => {}; }, registerUpgrade: () => () => {} };
+  const ctx3 = {
+    get: (n) => (n === 'webServer' ? ws3 : undefined),
+    on: () => () => {},
+    effect: (fn) => { const d = fn && fn(); return d || (() => {}); },
+    logger: { info: () => {}, warn: () => {} },
+  };
+  apply(ctx3, { runtimeDir: dir, upstreamPort: 1, bridgeToken: 'new-token' });
+  await new Promise((r) => setTimeout(r, 500));
+
+  const after = JSON.parse(readFileSync(file, 'utf8'));
+  check('没有覆盖运行中实例的 bridge.json', after.token === 'owner-token', JSON.stringify(after));
+  probe.close();
 }
 
 rmSync(tmp, { recursive: true, force: true });

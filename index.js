@@ -43,6 +43,16 @@ const CHAT_MAX_MESSAGES = 40;
 /** 单条选区注入正文上限，避免把整个大文件塞进 prompt。 */
 const CHAT_CONTEXT_MAX = 12000;
 
+/**
+ * 崩溃重启的退避曲线：1s、2s、4s…上限 30s。
+ * attempt 从 1 开始；0 或负数按第 1 次处理，避免退化成 0ms 风暴。
+ * @param {number} attempt 已尝试次数
+ * @returns {number} 毫秒
+ */
+export function backoffMs(attempt) {
+  return Math.min(30000, 1000 * 2 ** Math.max(0, attempt - 1));
+}
+
 /** 生成 provider 中立的消息 id（adapter 只读 role/content/source，id 仅需唯一）。 */
 let messageSeq = 0;
 function nextMessageId() {
@@ -172,7 +182,14 @@ function ensureEditorSettings(userDataDir, config) {
 async function startServer(config, ctx, bridge) {
   const runtimeDir = expand(config.runtimeDir || '~/.dsh/editor-runtime');
   const entry = findEntry(runtimeDir);
-  if (!entry) throw new Error(`code-server 未安装：在 ${runtimeDir} 下找不到 out/node/entry.js`);
+  if (!entry) {
+    // 这是唯一需要用户动手的失败，说清楚怎么做，别让它变成一块白屏。
+    throw new Error(
+      `code-server 未安装：在 ${runtimeDir} 下找不到 out/node/entry.js。`
+      + ` 安装：mkdir -p ${runtimeDir} && cd ${runtimeDir} && npm init -y && `
+      + 'FORCE_NODE_VERSION=24 npm install code-server@4.145.2',
+    );
+  }
 
   const nodeBin = expand(config.nodeBin || '') || findNode();
   const host = config.upstreamHost || '127.0.0.1';
@@ -245,7 +262,8 @@ async function startServer(config, ctx, bridge) {
 async function waitReady(state, child) {
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) return false;
+    // 进程已退出就没必要再等满 20 秒 —— 那会让崩溃重启白等一轮。
+    if (child.exitCode !== null || child.signalCode !== null) return false;
     try {
       const res = await fetch(`${state.upstream}/`, { signal: AbortSignal.timeout(2000) });
       const text = await res.text();
@@ -360,15 +378,50 @@ function selfBase(webServer) {
   return port ? `http://${host}:${port}` : '';
 }
 
-/** 把 {base, token} 落到运行时目录：扩展主机在 DSH 重启、env 丢失时按此文件兜底。 */
-function writeBridgeFile(runtimeDir, info) {
+/**
+ * 把 {base, token} 落到运行时目录：扩展主机在 DSH 重启、env 丢失时按此文件兜底。
+ *
+ * 多实例安全：同一个 runtimeDir 可能被多个 DSH 实例共用（例如开发时并排跑一个
+ * 测试实例），无条件写入会让**后启动的覆盖先启动的**，导致扩展把请求发到别的实例。
+ * 因此写入前先探活：文件里记录的 base 若仍可达就放弃覆盖（让出给运行中的实例）。
+ *
+ * @param runtimeDir 运行时目录
+ * @param info {{ base: string, token: string, updatedAt: number }}
+ * @returns 实际生效的桥接文件路径；写入失败或让出时为空串
+ */
+async function writeBridgeFile(runtimeDir, info) {
   try {
     mkdirSync(runtimeDir, { recursive: true });
     const file = join(runtimeDir, 'bridge.json');
+    const owner = await readLiveBridgeOwner(file);
+    // 已有别的实例在跑且可达：不覆盖，避免把扩展指向错的地方。
+    if (owner && owner.base && owner.base !== info.base) return '';
     writeFileSync(file, `${JSON.stringify(info, null, 2)}\n`, { mode: 0o600 });
     return file;
   } catch {
     return '';
+  }
+}
+
+/**
+ * 读现有 bridge.json 并探活。
+ * 只要目标端口有 HTTP 应答（含 401）就认为那个实例还活着。
+ * @param file bridge.json 路径
+ * @returns 仍然存活的记录；不存在或已失效返回 null
+ */
+async function readLiveBridgeOwner(file) {
+  let prev;
+  try {
+    prev = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!prev?.base) return null;
+  try {
+    await fetch(`${prev.base}/editor-status`, { signal: AbortSignal.timeout(800) });
+    return prev;
+  } catch {
+    return null;
   }
 }
 
@@ -574,7 +627,12 @@ export function apply(ctx, config = {}) {
   void port;
 
   // 服务就绪后再装配；拿不到时延迟重试而不是抛错（见 whenWebServer 注释）。
-  const stopWaiting = whenWebServer(ctx, (webServer) => installEditor(ctx, config, webServer));
+  const stopWaiting = whenWebServer(ctx, (webServer) => {
+    // installEditor 现在是 async（桥接文件探活需要网络往返）；失败不能让整行崩掉。
+    void installEditor(ctx, config, webServer).catch((err) => {
+      ctx.logger?.warn?.(`[editor-mode] 装配失败：${String(err?.message || err)}`);
+    });
+  });
   ctx.effect(() => () => stopWaiting());
 }
 
@@ -585,9 +643,12 @@ export function apply(ctx, config = {}) {
  * @param config 插件 config（cordis.patch.yml 的 editor-mode.config）
  * @param webServer @deepseek-ai/dsh-host-webserver 服务实例
  */
-function installEditor(ctx, config, webServer) {
+async function installEditor(ctx, config, webServer) {
 
-  const state0 = { status: 'starting', upstream: '', workspace: '', log: '' };
+  const state0 = {
+    status: 'starting', upstream: '', workspace: '', log: '',
+    error: '', restarts: 0, nextRetryMs: 0,
+  };
   let runtime = null;
 
   // 「编辑器 → DSH Agents」选区桥：有界队列，避免无限堆积。
@@ -603,7 +664,8 @@ function installEditor(ctx, config, webServer) {
   // 本机基址：扩展主机用它回调 DSH 的桥接与 Chat 端点。
   const base = selfBase(webServer);
   // 落一份到运行时目录：DSH 重启后扩展主机按 env → 文件的顺序回退，避免静默失效。
-  const bridgeFile = writeBridgeFile(
+  // 若已有其它实例占用且可达，这里不覆盖（多实例并存时不抢通道）。
+  const bridgeFile = await writeBridgeFile(
     expand(config.runtimeDir || '~/.dsh/editor-runtime'),
     { base, token: bridgeToken, updatedAt: Date.now() },
   );
@@ -623,19 +685,24 @@ function installEditor(ctx, config, webServer) {
     path: '/editor-status',
     handler: (req, res) => {
       if (rejected(ctx, req, res)) return;
-      const s = runtime?.state ?? state0;
+      // 端口/工作目录来自上游实例，状态（starting/ready/degraded/restarting/failed）
+      // 来自汇总状态 state0 —— 崩溃重启时必须反映「正在重试」而不是旧的 degraded。
+      const s = runtime?.state ?? {};
       res.statusCode = 200;
       res.setHeader('content-type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
-        status: s.status ?? (runtime ? 'ready' : 'starting'),
-        pid: s.pid,
-        upstream: s.upstream,
-        workspace: s.workspace,
+        status: state0.status,
+        pid: runtime?.dead ? undefined : s.pid,
+        upstream: s.upstream || state0.upstream || '',
+        workspace: s.workspace || '',
         // Client 用它拼 ?folder=，让 code-server 打开插件配置的项目目录。
         folder: s.workspace || '',
-        // 排障用：Chat 是否可用、桥接信息落在哪。
+        // 排障用：Chat 是否可用、桥接信息落在哪、重启了几次。
         chat: Boolean(ctx.get('llm')),
         bridgeFile,
+        error: state0.error || '',
+        restarts: state0.restarts ?? 0,
+        nextRetryMs: state0.nextRetryMs ?? 0,
         log: (s.log || '').slice(-4000),
       }));
     },
@@ -847,26 +914,84 @@ function installEditor(ctx, config, webServer) {
     },
   }), 'editor-mode: /editor/ WebSocket proxy');
 
-  // 启动上游。
-  const boot = (async () => {
+  // ---- 崩溃自动重启 ----
+  // code-server 会因为内存峰值、扩展主机崩溃、端口被抢等原因退出。没有这层兜底时，
+  // 用户看到的是「编辑器突然白屏，必须重启 DSH」。这里按指数退避重拉，并给上限，
+  // 避免真正的配置错误（比如运行时缺失）导致无限重启风暴。
+  const MAX_RESTARTS = 5;
+  let restarts = 0;          // 已重试次数（成功后归零）
+  let restartTimer = null;
+  let stopping = false;      // 卸载中：不再重启
+
+  void 0;
+  /** 启动（或重启）上游，并安排下一次重试。 */
+  const boot = async () => {
+    if (stopping) return;
     try {
       const pushUrl = base ? `${base}/editor-bridge/push` : '';
-      runtime = await startServer(config, ctx, { token: bridgeToken, pushUrl, base });
+      const started = await startServer(config, ctx, { token: bridgeToken, pushUrl, base });
+      runtime = started;
       state0.status = 'starting';
-      const ok = await waitReady(runtime.state, runtime.child);
-      runtime.state.status = ok ? 'ready' : 'degraded';
-      ctx.logger?.info?.(`[editor-mode] code-server ${ok ? 'ready' : 'degraded'} at ${runtime.state.upstream}`);
+      state0.error = '';
+      state0.upstream = started.state.upstream;
+      // 进程退出 → 走统一的重启路径（正常卸载时的 stop 会置 stopping 屏蔽它）。
+      // 用闭包捕获这一轮的 child，避免重试后旧进程的 exit 事件误伤新进程。
+      const { child } = started;
+      child.on('exit', (code, signal) => {
+        if (stopping) return;
+        if (runtime?.child !== child) return; // 已经是新一轮了，忽略旧事件
+        runtime = { ...started, dead: true };
+        scheduleRestart(`code-server 退出（code=${code ?? 'null'} signal=${signal ?? 'null'}）`);
+      });
+      const ok = await waitReady(started.state, child);
+      if (ok) {
+        restarts = 0;               // 真正就绪才清零，避免「起来就崩」被当成成功
+        started.state.status = 'ready';
+      } else {
+        started.state.status = 'degraded';
+        scheduleRestart('code-server 起来了但工作台没有就绪');
+      }
+      ctx.logger?.info?.(`[editor-mode] code-server ${started.state.status} at ${started.state.upstream}`);
     } catch (err) {
       state0.status = 'failed';
+      state0.error = String(err?.message || err);
       state0.log = String(err?.stack || err);
       ctx.logger?.warn?.(`[editor-mode] 启动失败：${state0.log}`);
+      // 运行时缺失 / 端口非法这类配置问题不会因为重试自愈，只提示不重试。
+      if (/未安装/.test(state0.error)) return;
+      scheduleRestart(state0.error);
     }
-  })();
+  };
+
+  /** 安排一次重试；超过上限就停在 failed 状态并说明原因。 */
+  function scheduleRestart(reason) {
+    if (stopping || restartTimer) return;
+    if (restarts >= MAX_RESTARTS) {
+      state0.status = 'failed';
+      state0.error = `${reason}；已重试 ${restarts} 次仍失败，停止自动重启`;
+      ctx.logger?.warn?.(`[editor-mode] ${state0.error}`);
+      return;
+    }
+    restarts += 1;
+    const delay = backoffMs(restarts);
+    state0.status = 'restarting';
+    state0.error = reason;
+    state0.restarts = restarts;
+    state0.nextRetryMs = delay;
+    ctx.logger?.info?.(`[editor-mode] ${reason}；${delay}ms 后第 ${restarts}/${MAX_RESTARTS} 次重启`);
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      void boot();
+    }, delay);
+    restartTimer.unref?.();
+  }
 
   // 卸载时终止整组子进程（含其派生的扩展主机 / PTY），并释放路由。
   // 用独立进程组的负 pid，避免主进程退出后留下无法回收的孤儿。
   ctx.effect(() => {
     const stop = () => {
+      stopping = true; // 先屏蔽自动重启，否则 SIGTERM 会被当成崩溃又拉起来
+      if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
       const child = runtime?.child;
       if (!child || child.exitCode !== null) return;
       const kill = (sig) => {
@@ -887,7 +1012,8 @@ function installEditor(ctx, config, webServer) {
       stop();
     };
   });
-  void boot;
+  // 首启。失败会走 scheduleRestart 自动重试（配置类故障除外）。
+  void boot();
 
   return { state: state0, getRuntime: () => runtime };
 }
@@ -897,6 +1023,7 @@ function installEditor(ctx, config, webServer) {
  * 这些纯函数不做 I/O，单独测试能覆盖掉 Chat 的消息组装/上下文注入逻辑。
  */
 export const __internals = {
+  backoffMs,
   composeSystem,
   appendContext,
   composeMessages,

@@ -160,6 +160,8 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
 | `sse.test.mjs` | 逐字节切分、CRLF、多行 data、无尾随空行的最后一条 |
 | `markdown.test.mjs` | XSS 转义、未闭合代码块、列表/标题/引用 |
 | `webview-wiring.test.mjs` | 模板占位符、命令/视图 id、消息协议两端对齐、token 不外泄 |
+| `host-late-service.test.mjs` | webServer 晚于插件就绪时仍能装配（旧实现在此永久不激活） |
+| `host-restart.test.mjs` | 崩溃退避曲线、重启上限、运行时缺失不重试 |
 | `integration-chat.live.mjs` | 假 vscode 加载扩展 → 真 DSH → 真模型 → postMessage 回 webview |
 
 ## 已知边界
@@ -167,7 +169,10 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
 - **iframe 直连回环**，非同源反代：code-server 的 WebSocket 走多条动态路径，而 DSH
   `registerUpgrade` 只支持 exact path；跨 origin 由 `--trusted-origins '*'` + `--auth none`
   放行，仅监听 `127.0.0.1`。
-- 无 Config schema、无运行时自动下载/校验、无崩溃自动重启。
+- 无 Config schema、无运行时自动下载/校验。
+- code-server **崩溃会自动重启**（指数退避 1s→30s，上限 5 次，成功后计数归零）。
+  重启中 / 失败时 `/editor-status` 返回 `status: restarting|failed` 与 `error`，
+  面板会显示对应提示并自动探活，恢复后自己重建 iframe。运行时未安装这类配置问题不重试。
 - **`webServer` 是声明式依赖**（`export const inject = ['webServer']`），另有轮询兜底：
   cordis 可能在本插件之后才就绪 `webserver`，旧实现直接 throw 会让这一行永久不激活，
   现象是全站 `/editor*` 404、code-server 不起，而桌面端把该错误吞进 stderr。
@@ -182,6 +187,18 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
   `Service not found`，且错误发生在槽渲染时，表现为编辑器面板整片白屏。
   一律用 `ctx.get(name)`，它对未提供的服务返回 `undefined` 而不抛错。
   `test/client-inject.test.mjs` 会真实执行每个槽的 inject 回调来守住这条。
+
+## 开发注意
+
+**改 Host 半边（`index.js`）后必须重启 DSH**，热重载不会重新 import 主入口。
+只改 `client.js` 则刷新 GUI 页面即可；只改 VS Code 扩展（`extensions/**`）需重启 code-server。
+
+改完先跑：
+
+```bash
+node test/run-all.mjs             # 离线单测（7 个用例）
+node test/integration-chat.live.mjs   # 真实 DSH + 真实模型
+```
 
 ## 许可
 

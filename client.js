@@ -67,6 +67,7 @@ window.__ModuleLoader__.load({
         background:var(--dsw-alias-bg-canvas,#fff);}
       .dem-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-fg-tertiary,#bbb);}
       .dem-hint{font-size:11px;opacity:.65;max-width:60ch;text-align:center;line-height:1.6;}
+      .dem-state-title{font-size:13px;font-weight:600;color:var(--dsw-alias-fg-primary,#111);}
     `;
 
     function Style() {
@@ -166,7 +167,8 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         let alive = true;
         const ctrl = new AbortController();
-        (async () => {
+        let timer = null;
+        const probe = async () => {
           try {
             const r = await fetch('/editor-status', { signal: ctrl.signal });
             if (!r.ok) {
@@ -182,9 +184,15 @@ window.__ModuleLoader__.load({
               // 只在用户还没手动选过目录时采用 Host 默认目录。
               setFolder((prev) => prev || j.folder || '');
             }
+            // 后端在启动/重启/失败时继续探活：恢复后自动重建 iframe，
+            // 用户不用手动点「重载」。
+            if (alive && j?.status && j.status !== 'ready') {
+              timer = setTimeout(probe, Math.max(1000, Number(j.nextRetryMs) || 1500));
+            }
           } catch { /* 保留兜底地址，不影响 iframe */ }
-        })();
-        return () => { alive = false; ctrl.abort(); };
+        };
+        void probe();
+        return () => { alive = false; ctrl.abort(); if (timer) clearTimeout(timer); };
       }, [nonce]);
 
       const reload = useCallback(() => {
@@ -243,10 +251,9 @@ window.__ModuleLoader__.load({
           allow: 'clipboard-read; clipboard-write; fullscreen',
           onLoad: () => setLoaded(true),
         }),
-        // Host 路由不存在 = 插件 Host 半边没加载，iframe 必然是白的。
-        // 这种故障必须直说，并把排查线索给全（否则用户只能对着白板猜）。
+        // 后端异常时给出与状态匹配的说明，而不是让人对着白板猜。
         !hostOk ? h('div', { className: 'dem-state' },
-          h('span', { style: { fontSize: 13, fontWeight: 600 } }, '编辑器后端未启动'),
+          h('span', { className: 'dem-state-title' }, '编辑器后端未启动'),
           h('span', { className: 'dem-hint' },
             '/editor-status 返回 404 —— 宿主插件（editor-mode）的 Host 半边没有加载。'),
           h('span', { className: 'dem-hint' },
@@ -255,14 +262,28 @@ window.__ModuleLoader__.load({
             className: 'dem-btn', type: 'button',
             onClick: () => { setLoaded(false); setNonce((n) => n + 1); },
           }, '重试'))
-          : (!loaded ? h('div', { className: 'dem-state' },
-            h('span', { className: 'dem-dot' }),
-            h('span', null, stalled ? '编辑器仍未就绪' : '正在连接编辑器…'),
-            h('span', { className: 'dem-hint' }, label),
-            stalled ? h('span', { className: 'dem-hint' },
-              '若长时间空白：点「重载」；仍不行说明 code-server 没起来（见 README 排查）。') : null,
-            stalled ? h('button', { className: 'dem-btn', type: 'button', onClick: reload }, '重载') : null,
-          ) : null));
+          : (info?.status === 'failed' || info?.status === 'restarting'
+            ? h('div', { className: 'dem-state' },
+              h('span', { className: 'dem-state-title' },
+                info.status === 'failed' ? '编辑器启动失败' : '编辑器正在重启'),
+              info?.error ? h('span', { className: 'dem-hint' }, String(info.error)) : null,
+              info?.status === 'restarting'
+                ? h('span', { className: 'dem-hint' },
+                  `第 ${info.restarts || 1} 次自动重启，稍候会自动连上…`)
+                : null,
+              info?.status === 'failed'
+                ? h('span', { className: 'dem-hint' },
+                  '若提示 code-server 未安装，按上面的命令装好后再点重试。')
+                : null,
+              h('button', { className: 'dem-btn', type: 'button', onClick: reload }, '重载'))
+            : (!loaded ? h('div', { className: 'dem-state' },
+              h('span', { className: 'dem-dot' }),
+              h('span', null, stalled ? '编辑器仍未就绪' : '正在连接编辑器…'),
+              h('span', { className: 'dem-hint' }, label),
+              stalled ? h('span', { className: 'dem-hint' },
+                '若长时间空白：点「重载」；仍不行说明 code-server 没起来（见 README 排查）。') : null,
+              stalled ? h('button', { className: 'dem-btn', type: 'button', onClick: reload }, '重载') : null,
+            ) : null)));
     }
 
     return {

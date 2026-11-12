@@ -78,6 +78,8 @@ const ctx = {
 // runtimeDir 指向空目录：boot 会因找不到 code-server 而失败，这是预期的
 // （本测试只验证 Chat 端点，不验证进程托管）。
 apply(ctx, { runtimeDir: tmp, upstreamPort: 1, bridgeToken: TOKEN });
+// installEditor 是 async：等路由注册完成后再跑断言。
+await new Promise((resolve) => setTimeout(resolve, 300));
 
 /** 造一个假 IncomingMessage。 */
 function makeReq({ method = 'GET', url = '/', headers = {}, body, ip = '127.0.0.1' }) {
