@@ -222,7 +222,9 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'layout'],
+      // sessions 必须声明：桥接需要按 sessionId 解析 scope。未 inject 时访问
+      // ctx.sessions 会直接抛错，而错误发生在槽 entries 遍历中会让整个 main 面板崩。
+      inject: ['slots', 'layout', 'sessions'],
       apply(ctx) {
         // 右上角分段控件
         ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
@@ -247,23 +249,33 @@ window.__ModuleLoader__.load({
           key: PANEL_ID,
           inject: () => ({
             layout: ctx.layout,
-            uiWorkspace: ctx.uiWorkspace || ctx.get?.('uiWorkspace'),
+            // 必须用 ctx.get：uiWorkspace 未声明依赖时直接访问 ctx.uiWorkspace 会抛错。
+            uiWorkspace: ctx.get('uiWorkspace'),
           }),
         }, EditorPanel));
 
         // 选区注入桥：session 作用域，能拿到 conversation.input facade。
-        ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
-          name: 'conversation.input.dock',
-          id: `${NS}#bridge`,
-          order: 90,
-          label: () => 'DSH 编辑器选区桥',
-          inject: (sessionId) => {
-            const actx = ctx.sessions?.scope?.(sessionId);
-            const conversation = actx?.get?.('conversation');
-            const input = conversation?.input?.for?.(actx);
-            return { getInput: () => input };
-          },
-        }, BridgeDock));
+        // 整块防御式注册：桥接是可选增强，任何失败都不能影响编辑器主面板。
+        try {
+          const sessions = ctx.get('sessions');
+          if (sessions?.scope) {
+            ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+              name: 'conversation.input.dock',
+              id: `${NS}#bridge`,
+              order: 90,
+              label: () => 'DSH 编辑器选区桥',
+              inject: (sessionId) => {
+                let input;
+                try {
+                  const actx = sessions.scope(sessionId);
+                  const conversation = actx?.get?.('conversation');
+                  input = conversation?.input?.for?.(actx);
+                } catch { /* 该 session 尚未保留 scope 时静默降级 */ }
+                return { getInput: () => input };
+              },
+            }, BridgeDock));
+          }
+        } catch { /* 桥接不可用时不影响编辑器 */ }
 
         // 轮询 Host 的待发送选区队列：扩展 POST → Host 缓存 → 这里取走。
         // 取到后切回 Agents 并派发事件，由 BridgeDock 注入输入框。

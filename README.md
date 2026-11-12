@@ -101,6 +101,10 @@ push 端点只接受回环请求，防止同机其它进程注入。
 - 联动目前是**单向**（编辑器 → Agents 输入框）且用轮询；反向（Agent 改文件后在编辑器高亮、
   选中即问的内联体验）尚未实现。
 - 输入框注入依赖 `conversation.input` facade 的 `setDraft`，若 DSH 升级改动该契约需同步适配。
+- **不要直接访问未在 `inject` 声明的 cordis 服务**（如 `ctx.uiWorkspace`）：会抛
+  `Service not found`，且错误发生在槽渲染时，表现为编辑器面板整片白屏（连标题栏都没有）。
+  一律用 `ctx.get(name)`，它对未提供的服务返回 `undefined` 而不抛错。
+  `test/client-inject.test.mjs` 会真实执行每个槽的 inject 回调来守住这条。
 
 ## 许可
 
