@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const MEDIA = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.2.0', 'media');
+const MEDIA = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.3.0', 'media');
 const src = readFileSync(join(MEDIA, 'chat.js'), 'utf8');
 
 let failed = 0;

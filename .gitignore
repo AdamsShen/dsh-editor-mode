@@ -3,3 +3,5 @@ node_modules/
 *.log
 # code-server 用 --extensions-dir 扫描时生成的缓存，不纳入版本控制
 extensions/extensions.json
+# 同上：code-server 的废弃标记，也是运行时生成，不入库
+extensions/.obsolete

@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(
-  join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.2.0', 'media', 'markdown.js'),
+  join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.3.0', 'media', 'markdown.js'),
   'utf8',
 );
 

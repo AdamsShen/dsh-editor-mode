@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { parseSseBlock, createSseParser } = require(
-  join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.2.0', 'sse.js'),
+  join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.3.0', 'sse.js'),
 );
 
 let failed = 0;

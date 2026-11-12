@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXT_DIR = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.2.0');
+const EXT_DIR = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.3.0');
 const require = createRequire(import.meta.url);
 
 let failed = 0;

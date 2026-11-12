@@ -12,7 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXT = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.2.0');
+const EXT = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.3.0');
 const html = readFileSync(join(EXT, 'media', 'chat.html'), 'utf8');
 const extensionSrc = readFileSync(join(EXT, 'extension.js'), 'utf8');
 const chatSrc = readFileSync(join(EXT, 'media', 'chat.js'), 'utf8');

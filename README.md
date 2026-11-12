@@ -17,7 +17,7 @@ DSH（DeepSeek Harness）编辑器模式插件：安装后在右上角切换 **A
 | `index.js` | Host 半边：托管 code-server 进程、`/editor-status`、`/editor-bridge/*` 选区桥、`/editor/*` 反代、进程组清理、端口自动探测 |
 | `sessions.js` | 会话桥：把 `/editor-sessions/*` 搬到 DSH 的 `sessionController`（会话即真实 Agent） |
 | `client.js` | Client 半边：`main` 全屏面板（key=`editor`）、侧栏图标、右上角分段控件、选区轮询与输入框注入 |
-| `extensions/local.dsh-editor-bridge-0.2.0/` | 随包发布的 VS Code 扩展：侧栏 Chat（webview）+ 选区发给 Agents |
+| `extensions/local.dsh-editor-bridge-0.3.0/` | 随包发布的 VS Code 扩展：侧栏 Chat（webview）+ 选区发给 Agents |
 | `extensions/…/sse.js` | SSE 增量解析（可单测） |
 | `extensions/…/media/markdown.js` | 侧栏 Markdown 渲染（纯函数，可单测） |
 | `cordis.patch.yml` | Loader patch，插入 `editor-mode` 行并声明 config |

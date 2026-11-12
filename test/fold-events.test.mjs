@@ -8,7 +8,7 @@
  */
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { foldEvents, summarizeToolResult, formatArgs } = require('../extensions/local.dsh-editor-bridge-0.2.0/session-view.js');
+const { foldEvents, summarizeToolResult, formatArgs } = require('../extensions/local.dsh-editor-bridge-0.3.0/session-view.js');
 
 let failed = 0;
 function check(name, condition, detail) {
