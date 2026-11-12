@@ -66,11 +66,15 @@ for (const handler of listeners.get('internal/service') || []) handler('webServe
 await new Promise((r) => setTimeout(r, 300));
 
 check('/editor-status 已注册', routes.has('exact:/editor-status'), [...routes.keys()].join(','));
-check('/editor-chat/send 已注册', routes.has('exact:/editor-chat/send'));
-check('/editor-chat/models 已注册', routes.has('exact:/editor-chat/models'));
 check('/editor-bridge/push 已注册', routes.has('exact:/editor-bridge/push'));
 check('/editor/ 反代前缀已注册', routes.has('prefix:/editor/'));
-check('恰好 8 条路由（4 chat/status + 2 bridge + 1 前缀）', routes.size >= 7, String(routes.size));
+// 会话桥（2026-11 取代了旧的 /editor-chat/* 纯 LLM 通路）
+check('/editor-sessions/list 已注册', routes.has('exact:/editor-sessions/list'));
+check('/editor-sessions/prompt 已注册', routes.has('exact:/editor-sessions/prompt'));
+check('/editor-sessions/stream 已注册', routes.has('exact:/editor-sessions/stream'));
+check('旧 /editor-chat/* 已不存在', ![...routes.keys()].some((k) => k.includes('/editor-chat/')),
+  [...routes.keys()].join(','));
+check('路由总数不少于 12', routes.size >= 12, String(routes.size));
 
 console.log('兜底路径：不发事件、只让服务出现');
 {

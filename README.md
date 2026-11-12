@@ -14,7 +14,8 @@ DSH（DeepSeek Harness）编辑器模式插件：安装后在右上角切换 **A
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半边：托管 code-server 进程、`/editor-status`、`/editor-bridge/*` 选区桥、`/editor-chat/*` 对话后端（接 `ctx.llm`）、`/editor/*` 反代、进程组清理、端口自动探测 |
+| `index.js` | Host 半边：托管 code-server 进程、`/editor-status`、`/editor-bridge/*` 选区桥、`/editor/*` 反代、进程组清理、端口自动探测 |
+| `sessions.js` | 会话桥：把 `/editor-sessions/*` 搬到 DSH 的 `sessionController`（会话即真实 Agent） |
 | `client.js` | Client 半边：`main` 全屏面板（key=`editor`）、侧栏图标、右上角分段控件、选区轮询与输入框注入 |
 | `extensions/local.dsh-editor-bridge-0.2.0/` | 随包发布的 VS Code 扩展：侧栏 Chat（webview）+ 选区发给 Agents |
 | `extensions/…/sse.js` | SSE 增量解析（可单测） |
@@ -84,7 +85,7 @@ npm install code-server@4.145.2
 形态与 Cursor / CodeBuddy 一致（`type: webview` 视图，不碰 workbench 源码）。同一视图 id 挂两个容器时，
 VS Code 各给一个宿主实例；点「打开 DSH Chat」命令会优先聚焦当前可见的那一侧，不会平白把另一侧也展开。
 
-**模型来源**：`/editor-chat/models` 读的是 DSH 自己的适配器注册表与
+**模型来源**：会话用的就是 DSH 当前会话的模型，不需要另配（`sessionController` 决定）。旧的 `/editor-chat/models` 读的是 DSH 自己的适配器注册表与
 `agentDefaultModel.currentSelection()`，所以下拉里就是你在 DSH 设置里配的那套
 provider / 模型（含自定义 endpoint），默认值就是 DSH 当前选定的模型；
 **插件不新增任何模型配置，也不保存任何 API Key**。
@@ -94,7 +95,7 @@ provider / 模型（含自定义 endpoint），默认值就是 DSH 当前选定�
 ```
 webview (media/chat.js)
   ⇅ postMessage
-扩展 Node 侧 (extension.js)  ──HTTP/SSE──▶  DSH Host /editor-chat/send
+扩展 Node 侧 (extension.js)  ──HTTP/SSE──▶  DSH Host /editor-sessions/{prompt,stream}
                                               ⇣
                                          ctx.llm.stream()
                                               ⇣
@@ -110,11 +111,13 @@ webview (media/chat.js)
 | 多轮 | 对话历史随请求带上（上限 40 条），按项目持久化在 `workspaceState` |
 | 模型切换 | 顶栏下拉按 provider 分组，选择按项目记住 |
 | 停止 | 「停止」同时 abort 本地请求与 DSH 上游生成（实测 finish=aborted） |
-| 交回 Agents | 回复下方「→ Agents」把内容送到 DSH Agents 输入框，由 Agent 真正动手改代码 |
+| 会话切换 | 顶部下拉列出最近会话，可与 DSH Agents 双向切换同一条会话 |
+| 历史面板 | 另一个视图，列出**全部工作区**的会话，按今天/昨天/近 7 天分组，可搜索 |
 | 复制 | 整条回复 / 单个代码块一键复制 |
 
-**边界（有意为之）**：侧栏 Chat 是**纯模型对话**，不给模型任何工具 —— 它不能读文件、
-不能跑命令、不能改代码。需要动手时用「→ Agents」升级到 DSH Agent。
+**定位（2026-11 变更）**：侧栏 Chat **就是 DSH 真实 Agent 会话的第二个视图**，
+默认带工具（能读文件、跑命令、改代码），与在 Agents 模式里对话是同一条会话。
+这是「双模式 X」：两个视图共用一份会话，切走再回来历史一致。
 
 ### 三、选区 → DSH Agents
 
@@ -134,9 +137,14 @@ webview (media/chat.js)
 | 端点 | 鉴权 | 用途 |
 |---|---|---|
 | `GET /editor-status` | DSH 会话 cookie | 端口/目录/状态 |
-| `GET /editor-chat/models` | 回环 + token | 模型目录 |
-| `POST /editor-chat/send` | 回环 + token | SSE 对话 |
-| `POST /editor-chat/abort` | 回环 + token | 停止生成 |
+| `GET /editor-sessions/list` | 回环 + token | 全部工作区会话 |
+| `GET /editor-sessions/search` | 回环 + token | 跨会话搜索 |
+| `POST /editor-sessions/create` | 回环 + token | 新建会话 |
+| `POST /editor-sessions/prompt` | 回环 + token | 发送消息 |
+| `POST /editor-sessions/cancel` | 回环 + token | 停止本回合 |
+| `POST /editor-sessions/rename` | 回环 + token | 重命名 |
+| `GET /editor-sessions/history` | 回环 + token | 历史页（含冷会话） |
+| `GET /editor-sessions/stream` | 回环 + token | SSE：snapshot / session-event / assistant-chunk |
 | `POST /editor-bridge/push` | 回环 + token | 选区入队 |
 | `GET /editor-bridge/pending` | DSH 会话 cookie | 选区出队 |
 | `/editor/*` | DSH 会话 cookie | HTTP 反代占位 |
@@ -156,7 +164,8 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
 | 用例 | 覆盖 |
 |---|---|
 | `client-inject.test.mjs` | 每个槽的 inject 回调在真实执行路径下不抛错（白屏回归） |
-| `host-chat.test.mjs` | `/editor-chat` 鉴权、SSE 事件序列、上下文注入、错误与中止 |
+| `session-bridge.test.mjs` | `/editor-sessions/*` 鉴权、各接口收敛、follow 三类帧→SSE、服务缺失 503 |
+| `fold-events.test.mjs` | 会话事件折叠：工具卡片、失败态、turn 收尾、过滤 DSH 注入的伪用户消息 |
 | `sse.test.mjs` | 逐字节切分、CRLF、多行 data、无尾随空行的最后一条 |
 | `markdown.test.mjs` | XSS 转义、未闭合代码块、列表/标题/引用 |
 | `webview-wiring.test.mjs` | 模板占位符、命令/视图 id、消息协议两端对齐、token 不外泄 |
@@ -196,9 +205,28 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
 改完先跑：
 
 ```bash
-node test/run-all.mjs             # 离线单测（7 个用例）
+node test/run-all.mjs             # 离线单测（8 个用例）
 node test/integration-chat.live.mjs   # 真实 DSH + 真实模型
 ```
+
+### 与 DSH 会话 API 对接时踩过的坑（2026-11，DSH 0.2.2-rc.1）
+
+都是实测出来的真实行为，不是猜测，改动前请先看：
+
+1. **`address` 是 `{kind:'session', sessionId}`**，不是 `{kind:'session', id}`。
+   写错时 DSH 报 `failed to observe session "undefined"`。
+2. **`follow()` 必须显式传 `assistantStream: true`**，否则只有持久事件、
+   没有文字增量帧，表现是「一直转圈但不出字」。
+3. **历史页必须传 `beforeSeq`**。不传时 DSH 的 `paginate` 会返回空页
+   （`cursor` 正常、`records` 为空）。另注意 `Number(null) === 0`：
+   把「没传」误当成 `beforeSeq=0` 同样拿到空页。
+4. **历史与快照里的数据在 `records` 里**，每项是 `{type:'event', event}`，
+   直接读 `events` 永远是空数组。
+5. **`user/message` 的内容在 `data.content`**，而 `assistant/message` 在
+   `data.message.content`；两者形状不同。
+6. **DSH 会把运行时上下文/技能目录/时间快照也写成 `user/message`**，
+   `source.kind` 分别是 `runtime-context` / `skill-catalog` / `time-context`，
+   渲染前必须按 `source.kind === 'user'` 过滤，否则界面全是噪音。
 
 ## 许可
 

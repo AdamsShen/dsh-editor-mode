@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-editor-mode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "DSH 编辑器模式：右上角一键在 Agents 对话与内置 VS Code 编辑器之间切换",

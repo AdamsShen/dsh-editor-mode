@@ -11,9 +11,9 @@
 <body>
   <div class="app">
     <header class="bar">
-      <select id="model" class="model" title="选择模型（来自 DSH 的配置）"></select>
-      <button id="refresh" class="icon-btn" title="刷新模型列表">⟳</button>
-      <button id="new" class="icon-btn" title="新对话">＋</button>
+      <select id="session" class="session" title="当前会话（与 DSH Agents 同一个）"></select>
+      <button id="rename" class="icon-btn" title="重命名当前会话">✎</button>
+      <button id="new" class="icon-btn" title="新建会话">＋</button>
     </header>
 
     <div id="error" class="error" hidden></div>
@@ -21,20 +21,17 @@
     <main id="log" class="log">
       <div id="empty" class="empty">
         <p class="empty-title">DSH Chat</p>
-        <p class="empty-hint">直接用你在 DSH 里配置的模型提问。<br />
-          勾选下方「带上下文」会把当前文件与选区一并发给模型。</p>
-        <p class="empty-hint dim">需要真正改文件时，点回复下方的「→ Agents」交回 DSH。</p>
+        <p class="empty-hint">这是 DSH 真实 Agent 会话，<b>能改文件、能跑命令</b>。<br />
+          在编辑器里问过的问题，切到 DSH Agents 模式能看到同一条会话。</p>
+        <p class="empty-hint dim">历史面板里可以按工作区翻旧会话。</p>
       </div>
     </main>
 
     <footer class="composer">
       <div class="composer-top">
-        <button id="ctx" class="chip" type="button" aria-pressed="true">
-          <span class="dot"></span><span class="chip-label">带上下文</span>
-        </button>
         <span id="ctxinfo" class="ctxinfo"></span>
       </div>
-      <textarea id="input" rows="3" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <textarea id="input" rows="3" placeholder="让 DSH 改点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
       <div class="composer-bottom">
         <span id="hint" class="hint"></span>
         <button id="stop" class="btn secondary" hidden>停止</button>

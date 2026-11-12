@@ -1,10 +1,11 @@
 /**
  * DSH Editor Bridge —— VS Code 扩展（Node 扩展主机）。
  *
- * 三个能力：
- *  1. 侧栏 Chat：activitybar 里的 webview 视图，前端是 media/chat.js，
- *     通过本文件的 Node 侧转发到 DSH 的 /editor-chat/*（流式 SSE），
- *     模型与凭据全部复用 DSH 里已配置的那套（插件不新增任何模型配置）。
+ * 四个能力：
+ *  1. 侧栏 Chat：webview 视图，**是 DSH 真实 Agent 会话的第二个视图**
+ *     （2026-11 起，不再是独立纯模型对话）。消息走 /editor-sessions/*，
+ *     所以编辑器里问过的问题，切到 DSH Agents 模式能看到同一条会话。
+ *  2. 历史面板：另一个 webview 视图，列出**全部工作区**的会话，可搜索、可切换。
  *  2. 选区 → DSH Agents：把当前文件/选区 POST 到 /editor-bridge/push，
  *     由 DSH Client 轮询取走并注入 Agents 输入框。
  *  3. 选区 → 本侧栏 Chat：右键「在 DSH Chat 中询问选中代码」，把上下文填进输入框。
@@ -27,6 +28,9 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { parseSseBlock, createSseParser } = require('./sse.js');
+const sessionView = require('./session-view.js');
+
+const HISTORY_VIEW_ID = 'dshEditor.history';
 
 const VIEW_ID = 'dshEditor.chat';
 const STATE_KEY = 'dshEditor.chat.v1';
@@ -235,93 +239,56 @@ function contextLabel(ctxInfo) {
 
 class ChatViewProvider {
   /**
-   * @param {vscode.ExtensionContext} context 扩展上下文（持久化用）
+   * @param {vscode.ExtensionContext} context 扩展上下文
    * @param {{pushToAgents: Function}} hooks 复用的 Agents 桥接
    */
   constructor(context, hooks) {
     this.context = context;
     this.hooks = hooks;
     this.view = null;
-    /** 最近一次可见的宿主视图 id（activitybar 或 secondarySidebar 各一个宿主）。 */
     this.visibleId = '';
     this.mediaRoot = vscode.Uri.joinPath(context.extensionUri, 'media');
-    /** chat.html 的磁盘绝对路径（读模板用，不走 webview URI）。 */
     this.mediaDir = path.join(context.extensionUri.fsPath, 'media');
-    /** @type {any} 会话状态：保留在内存，持久化到 workspaceState。 */
-    this.state = this.loadState();
+    /** 当前绑定的 DSH 会话 id（空=还没建）。 */
+    this.sessionId = '';
+    this.sessionTitle = '';
+    this.messages = [];
+    this.busy = false;
+    this.error = '';
     this.abort = null;
+    /** 正在累积的助手消息下标；-1 表示当前没有进行中的回复。 */
     this.streamingIndex = -1;
-    this.effectiveModel = '';
+    this.sessions = [];
   }
 
-  /** 从 workspaceState 恢复（每个项目一份对话）。 */
-  loadState() {
-    const saved = this.context.workspaceState.get(STATE_KEY) || {};
-    return {
-      messages: Array.isArray(saved.messages) ? saved.messages.slice(-HISTORY_MAX) : [],
-      provider: typeof saved.provider === 'string' ? saved.provider : '',
-      model: typeof saved.model === 'string' ? saved.model : '',
-      contextEnabled: saved.contextEnabled !== false,
-      models: null,
-      busy: false,
-      error: '',
-    };
-  }
-
-  /** 写回 workspaceState（fire-and-forget，失败不影响对话）。 */
-  persist() {
-    const { messages, provider, model, contextEnabled } = this.state;
-    try {
-      // 只留可序列化且有内容的部分，占位消息不落盘。
-      const slim = messages
-        .filter((m) => !m.pending && String(m.content || '').trim())
-        .slice(-HISTORY_MAX)
-        .map((m) => ({ role: m.role, content: m.content }));
-      void this.context.workspaceState.update(STATE_KEY, { messages: slim, provider, model, contextEnabled });
-    } catch { /* 持久化失败不阻断对话 */ }
-  }
-
-  /** 把完整状态推给 webview。 */
-  postState() {
-    const ctxInfo = collectContext();
-    this.post({
-      type: 'state',
-      messages: this.state.messages,
-      models: this.state.models,
-      provider: this.state.provider,
-      model: this.state.model,
-      busy: this.state.busy,
-      error: this.state.error,
-      contextEnabled: this.state.contextEnabled,
-      contextLabel: contextLabel(ctxInfo),
-      hasEditor: Boolean(ctxInfo),
-      effectiveModel: this.effectiveModel,
-    });
-  }
-
-  /**
-   * 当前真正可见的那个视图 id。
-   *
-   * 同一个视图 id 同时挂在 activitybar 与 secondarySidebar 两个容器上，
-   * resolveWebviewView 会被调用两次（两个宿主各一次），只有可见的那个在
-   * 用；聚焦命令需要知道是哪一边，否则会把用户没在看的侧栏也展开。
-   */
-  visibleViewId() {
-    return this.visibleId || '';
-  }
+  visibleViewId() { return this.visibleId || ''; }
 
   post(message) {
     try { this.view?.webview.postMessage(message); } catch { /* 视图已销毁 */ }
   }
 
+  /** 当前完整状态（webview 只依赖这一个来源渲染）。 */
+  snapshot() {
+    const ctxInfo = collectContext();
+    return {
+      type: 'state',
+      sessionId: this.sessionId,
+      sessionTitle: this.sessionTitle,
+      messages: this.messages,
+      busy: this.busy,
+      error: this.error,
+      contextLabel: contextLabel(ctxInfo),
+      hasEditor: Boolean(ctxInfo),
+    };
+  }
+
+  postState() { this.post(this.snapshot()); }
+
   resolveWebviewView(webviewView) {
     this.view = webviewView;
     this.visibleId = webviewView.viewType || VIEW_ID;
     const webview = webviewView.webview;
-    webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this.mediaRoot],
-    };
+    webview.options = { enableScripts: true, localResourceRoots: [this.mediaRoot] };
     const nonce = crypto.randomBytes(16).toString('base64');
     const uri = (name) => webview.asWebviewUri(vscode.Uri.joinPath(this.mediaRoot, name)).toString();
     let html = '';
@@ -340,61 +307,50 @@ class ChatViewProvider {
     webview.html = html;
 
     webview.onDidReceiveMessage((message) => { void this.onMessage(message); });
-    const trackVisibility = (visible) => {
+    const track = (visible) => {
       if (!visible) return;
       this.visibleId = webviewView.viewType || VIEW_ID;
       this.postState();
+      // 双模式 X：切回编辑器时要看到「在 Agents 侧继续过的」同一会话，
+      // 所以重新加载历史并重挂实时流，而不是沿用上次的内存快照。
+      void this.refreshOnShow();
     };
-    trackVisibility(webviewView.visible !== false);
-    webviewView.onDidChangeVisibility(() => { trackVisibility(webviewView.visible); });
+    track(webviewView.visible !== false);
+    webviewView.onDidChangeVisibility(() => { track(webviewView.visible); });
     webviewView.onDidDispose(() => {
       if (this.view === webviewView) this.view = null;
       if (this.visibleId === (webviewView.viewType || VIEW_ID)) this.visibleId = '';
     });
-
-    // 模型目录是异步的，先给 UI 一个空态，拿到后补发。
     this.postState();
-    void this.refreshModels().then(() => this.postState());
   }
 
-  /** 拉取 DSH 侧真实可用的模型列表；失败记到 error，不阻塞对话。 */
-  async refreshModels() {
-    try {
-      const { status, json } = await getJson('/editor-chat/models');
-      if (status !== 200 || !json) {
-        this.state.models = null;
-        return;
-      }
-      this.state.models = { default: json.default || null, providers: json.providers || [] };
-      // 首次进入（或原选择已失效）时对齐到 DSH 的默认模型。
-      const exists = this.modelExists(this.state.provider, this.state.model);
-      if (!exists) {
-        const fallback = json.default
-          || (json.providers || []).map((p) => ({ provider: p.id, model: p.models?.[0]?.id }))[0];
-        if (fallback?.provider) {
-          this.state.provider = fallback.provider;
-          this.state.model = fallback.model || '';
-          this.persist();
-        }
-      }
-      if (json.error) this.state.error = String(json.error);
-    } catch (err) {
-      this.state.models = null;
-      this.state.error = `无法读取 DSH 模型列表：${String(err?.message || err)}`;
+  /** 统一的错误提示。 */
+  fail(err) {
+    this.error = String(err?.message || err);
+    this.busy = false;
+    this.postState();
+  }
+
+  /** 为当前工作区建一个会话（DSH 侧复用空白会话，不会堆空壳）。 */
+  async ensureSession() {
+    if (this.sessionId) return this.sessionId;
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const { status, json } = await sessionView.request(channel(), 'POST', '/editor-sessions/create', { cwd });
+    if (status !== 200 || !json?.sessionId) {
+      throw new Error(json?.error || `无法创建会话（HTTP ${status}）`);
     }
-  }
-
-  modelExists(provider, model) {
-    if (!provider || !model) return false;
-    const providers = this.state.models?.providers || [];
-    return providers.some((p) => p.id === provider && (p.models || []).some((m) => m.id === model));
+    this.sessionId = String(json.sessionId);
+    this.sessionTitle = '';
+    this.messages = [];
+    this.postState();
+    return this.sessionId;
   }
 
   async onMessage(message) {
     switch (message?.type) {
       case 'ready':
         this.postState();
-        if (!this.state.models) { void this.refreshModels().then(() => this.postState()); }
+        void this.listSessions();
         break;
       case 'send':
         await this.send(String(message.text || ''));
@@ -402,28 +358,19 @@ class ChatViewProvider {
       case 'stop':
         await this.stop();
         break;
-      case 'selectModel':
-        this.state.provider = String(message.provider || '');
-        this.state.model = String(message.model || '');
-        this.persist();
-        break;
-      case 'toggleContext':
-        this.state.contextEnabled = Boolean(message.enabled);
-        this.persist();
-        this.postState();
-        break;
       case 'newChat':
-        this.reset();
+        await this.newChat();
         break;
-      case 'escalate':
-        await this.escalate(Number(message.index));
+      case 'selectSession':
+        await this.selectSession(String(message.sessionId || ''));
         break;
-      case 'refreshModels':
-        await this.refreshModels();
-        this.postState();
+      case 'renameSession':
+        await this.renameSession(String(message.title || ''));
+        break;
+      case 'listSessions':
+        await this.listSessions();
         break;
       case 'prefill':
-        // 由命令「在 DSH Chat 中询问选中代码」触发，只填输入框不自动发送。
         this.post({ type: 'prefill', text: String(message.text || '') });
         break;
       case 'openFile':
@@ -434,15 +381,258 @@ class ChatViewProvider {
     }
   }
 
-  /** 清空对话（保留模型选择）。 */
-  reset() {
+  /**
+   * 视图重新可见时同步一次：历史可能有变化（用户在 Agents 侧继续聊过），
+   * 实时流可能已断（切走期间不会有人消费）。
+   */
+  async refreshOnShow() {
+    if (!this.sessionId) { await this.listSessions(); return; }
+    await this.loadHistory();
+    if (!this.busy) this.attach();
+    await this.listSessions();
+    this.syncTitle();
+    this.postState();
+  }
+
+  /** 拉会话列表（全部工作区），供切换器使用。 */
+  async listSessions() {
+    try {
+      const { status, json } = await sessionView.request(channel(), 'GET', '/editor-sessions/list');
+      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      this.sessions = Array.isArray(json?.items) ? json.items : [];
+      this.post({ type: 'sessions', items: this.sessions });
+    } catch (err) {
+      this.post({ type: 'sessions', items: [], error: String(err?.message || err) });
+    }
+  }
+
+  /** 新建一条会话（真建，不是清空数组）。 */
+  async newChat() {
+    this.detach();
+    this.sessionId = '';
+    this.sessionTitle = '';
+    this.messages = [];
+    this.error = '';
+    this.postState();
+    try { await this.ensureSession(); } catch (err) { this.fail(err); }
+    await this.listSessions();
+  }
+
+  /** 切到指定会话：先读历史，再挂上实时流。 */
+  async selectSession(sessionId) {
+    if (!sessionId || sessionId === this.sessionId) return;
+    this.detach();
+    this.sessionId = sessionId;
+    this.messages = [];
+    this.error = '';
+    this.postState();
+    await this.loadHistory();
+    this.attach();
+    await this.listSessions();
+  }
+
+  /** 读历史页并折叠成消息。 */
+  async loadHistory() {
+    if (!this.sessionId) return;
+    try {
+      const { status, json } = await sessionView.request(
+        channel(), 'GET', `/editor-sessions/history?sessionId=${encodeURIComponent(this.sessionId)}`,
+      );
+      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      const events = Array.isArray(json?.events) ? json.events : [];
+      this.messages = sessionView.foldEvents(events);
+      this.postState();
+    } catch (err) {
+      this.fail(err);
+    }
+  }
+
+  /** 把标题改成会话真实标题（从列表里取）。 */
+  syncTitle() {
+    const found = this.sessions.find((s) => s.id === this.sessionId);
+    if (found?.title) this.sessionTitle = found.title;
+  }
+
+  async renameSession(title) {
+    if (!this.sessionId || !title.trim()) return;
+    try {
+      const { status, json } = await sessionView.request(
+        channel(), 'POST', '/editor-sessions/rename', { sessionId: this.sessionId, title: title.trim() },
+      );
+      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      this.sessionTitle = title.trim();
+      this.postState();
+      await this.listSessions();
+    } catch (err) { this.fail(err); }
+  }
+
+  /** 卸掉实时流，避免切会话后旧流继续往新会话里灌数据。 */
+  detach() {
     if (this.abort) { try { this.abort.abort(); } catch { /* 已结束 */ } }
     this.abort = null;
-    this.state.messages = [];
-    this.state.busy = false;
-    this.state.error = '';
     this.streamingIndex = -1;
-    this.persist();
+    this.busy = false;
+  }
+
+  /** 发送一轮：先 prompt，再靠实时流把过程和结果画出来。 */
+  async send(text) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed || this.busy) return;
+    this.error = '';
+    this.busy = true;
+    // 乐观展示用户消息：不等会话事件回显，点击即有反馈。
+    this.messages.push({ role: 'user', parts: [{ type: 'text', text: trimmed }], reasoning: '' });
+    this.postState();
+
+    try {
+      await this.ensureSession();
+      const { status, json } = await sessionView.request(
+        channel(), 'POST', '/editor-sessions/prompt',
+        { sessionId: this.sessionId, text: trimmed },
+      );
+      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      this.attach();
+    } catch (err) {
+      this.fail(err);
+    }
+  }
+
+  /** 挂上实时流；已在跑就先卸掉旧的。 */
+  attach() {
+    if (!this.sessionId) return;
+    if (this.abort) { try { this.abort.abort(); } catch { /* 已结束 */ } }
+    this.abort = new AbortController();
+    const sessionId = this.sessionId;
+    const controller = this.abort;
+    void sessionView.streamSession(channel(), sessionId, {
+      signal: controller.signal,
+      onEvent: (event, data) => this.onStreamEvent(sessionId, event, data),
+    }).catch((err) => {
+      // 主动 abort 不算错误
+      if (controller.signal.aborted) return;
+      this.error = String(err?.message || err);
+      this.busy = false;
+      this.postState();
+    });
+  }
+
+  /** 实时流的单帧处理：文字增量就地追加，工具事件单独成卡。 */
+  onStreamEvent(sessionId, event, data) {
+    if (sessionId !== this.sessionId) return; // 旧流的尾巴，丢弃
+    switch (event) {
+      case 'snapshot': {
+        // 重连时的开篇快照：用折叠结果覆盖，保证与服务端一致。
+        const events = Array.isArray(data?.events) ? data.events : [];
+        if (events.length) {
+          const folded = sessionView.foldEvents(events);
+          if (folded.length) this.messages = folded;
+        }
+        this.postState();
+        break;
+      }
+      case 'assistant-start':
+        this.busy = true;
+        this.streamingIndex = this.ensureAssistant();
+        this.postState();
+        break;
+      case 'assistant-chunk': {
+        const chunk = data || {};
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          const index = this.ensureAssistant();
+          const msg = this.messages[index];
+          const last = msg.parts[msg.parts.length - 1];
+          if (last && last.type === 'text') last.text += chunk.text;
+          else msg.parts.push({ type: 'text', text: chunk.text });
+          this.post({ type: 'append', index, text: chunk.text });
+        } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+          const index = this.ensureAssistant();
+          this.messages[index].reasoning += chunk.text;
+          this.post({ type: 'reasoning', index, text: chunk.text });
+        } else if (chunk.type === 'tool-call-delta') {
+          // 参数增量：这里不逐字画，等 assistant/message 事件的完整块。
+          break;
+        }
+        break;
+      }
+      case 'session-event': {
+        const type = String(data?.type || '');
+        const payload = data?.data || {};
+        if (type === 'tool/call') {
+          const index = this.ensureAssistant();
+          const callId = String(payload.callId || '');
+          const msg = this.messages[index];
+          if (!msg.parts.some((p) => p.type === 'tool' && p.callId === callId)) {
+            msg.parts.push({
+              type: 'tool',
+              callId,
+              name: String(payload.toolName || payload.name || '工具'),
+              summary: sessionView.formatArgs(payload.arguments ?? payload.input),
+              result: '',
+              status: 'running',
+            });
+            this.postState();
+          }
+        } else if (type === 'tool/result') {
+          const callId = String(payload.message?.source?.callId || payload.callId || '');
+          const tool = this.findTool(callId);
+          if (tool) {
+            tool.status = payload.message?.isError ? 'error' : 'done';
+            tool.result = sessionView.summarizeToolResult(payload.message?.content);
+            this.postState();
+          }
+        } else if (type === 'turn/end') {
+          for (const msg of this.messages) {
+            for (const part of msg.parts || []) {
+              if (part.type === 'tool' && part.status === 'running') part.status = 'done';
+            }
+          }
+          this.busy = false;
+          this.streamingIndex = -1;
+          this.postState();
+          void this.listSessions();
+        } else if (type === 'session/title') {
+          this.sessionTitle = String(payload.title || '');
+          this.postState();
+        }
+        break;
+      }
+      case 'error':
+        this.error = String(data?.message || '会话流出错');
+        this.busy = false;
+        this.postState();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** 找到（或新建）一条助手消息并返回其下标。 */
+  ensureAssistant() {
+    if (this.streamingIndex >= 0 && this.messages[this.streamingIndex]?.role === 'assistant') {
+      return this.streamingIndex;
+    }
+    this.messages.push({ role: 'assistant', parts: [], reasoning: '' });
+    this.streamingIndex = this.messages.length - 1;
+    return this.streamingIndex;
+  }
+
+  /** 按 callId 找工具卡片。 */
+  findTool(callId) {
+    for (const msg of this.messages) {
+      for (const part of msg.parts || []) {
+        if (part.type === 'tool' && part.callId === callId) return part;
+      }
+    }
+    return null;
+  }
+
+  /** 停止当前回合：走 DSH 自己的 cancel，保证服务端真的停。 */
+  async stop() {
+    if (!this.sessionId) return;
+    try {
+      await sessionView.request(channel(), 'POST', '/editor-sessions/cancel', { sessionId: this.sessionId });
+    } catch { /* 通道已断也要把 UI 复位 */ }
+    this.detach();
     this.postState();
   }
 
@@ -461,137 +651,117 @@ class ChatViewProvider {
       vscode.window.showWarningMessage(`无法打开 ${file}：${String(err?.message || err)}`);
     }
   }
+}
 
-  /** 把一条助手回复交给 DSH Agents（复用已有选区桥）。 */
-  async escalate(index) {
-    const message = this.state.messages[index];
-    if (!message || message.role !== 'assistant' || !String(message.content || '').trim()) {
-      vscode.window.showInformationMessage('没有可发送的回复');
-      return;
-    }
-    const ok = this.hooks.pushToAgents({
-      file: '',
-      line: 0,
-      text: String(message.content).slice(0, 8000),
-    });
-    if (ok) vscode.window.setStatusBarMessage('已发送到 DSH Agents', 2000);
-    else vscode.window.showWarningMessage('DSH Agents 通道未就绪');
-  }
+// ---------------------------------------------------------------------------
+// 历史面板：全部工作区的会话
+// ---------------------------------------------------------------------------
 
-  /** 停止当前生成：先 abort 本地请求，再通知 DSH 侧中断上游。 */
-  async stop() {
-    if (!this.state.busy) return;
-    const requestId = this.state.requestId;
-    try { this.abort?.abort(); } catch { /* 已结束 */ }
-    if (requestId) {
-      try { await postJson('/editor-chat/abort', { requestId }, 5000); } catch { /* 通道已断 */ }
-    }
-  }
-
+class HistoryViewProvider {
   /**
-   * 发送一轮对话。
-   * 流程：入队用户消息 → 建助手占位 → 流式追加 → 落盘。
-   * 模型与上下文都取自用户当前配置，不在这里做任何默认值发明。
+   * @param {vscode.ExtensionContext} context 扩展上下文
+   * @param {{openSession:(id:string)=>Promise<void>}} hooks 打开会话的回调
    */
-  async send(text) {
-    const trimmed = String(text || '').trim();
-    if (!trimmed || this.state.busy) return;
+  constructor(context, hooks) {
+    this.context = context;
+    this.hooks = hooks;
+    this.view = null;
+    this.mediaRoot = vscode.Uri.joinPath(context.extensionUri, 'media');
+    this.mediaDir = path.join(context.extensionUri.fsPath, 'media');
+    this.items = [];
+    this.query = '';
+    this.error = '';
+  }
 
-    this.state.error = '';
-    this.state.busy = true;
-    this.state.messages.push({ role: 'user', content: trimmed });
+  post(message) {
+    try { this.view?.webview.postMessage(message); } catch { /* 视图已销毁 */ }
+  }
 
-    // 发给模型的 messages 不含这条空占位。
-    const history = this.state.messages
-      .filter((m) => String(m.content || '').trim())
-      .slice(-HISTORY_MAX)
-      .map((m) => ({ role: m.role, content: String(m.content).slice(0, MESSAGE_MAX) }));
+  postState() {
+    this.post({
+      type: 'state',
+      items: this.items,
+      query: this.query,
+      error: this.error,
+      grouped: groupByDay(this.items),
+    });
+  }
 
-    const index = this.state.messages.length;
-    this.state.messages.push({ role: 'assistant', content: '', reasoning: '', pending: true });
-    this.streamingIndex = index;
-
-    const requestId = `r${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`;
-    this.state.requestId = requestId;
-    this.abort = new AbortController();
-    this.postState();
-
-    const payload = {
-      requestId,
-      provider: this.state.provider,
-      model: this.state.model,
-      messages: history,
-      context: this.state.contextEnabled ? (collectContext() || undefined) : undefined,
-    };
-    // history 已包含本轮的 user 消息；appendContext 在 Host 侧追加到这条上。
-    let streamError = '';
-    let finishKind = '';
+  resolveWebviewView(webviewView) {
+    this.view = webviewView;
+    const webview = webviewView.webview;
+    webview.options = { enableScripts: true, localResourceRoots: [this.mediaRoot] };
+    const nonce = crypto.randomBytes(16).toString('base64');
+    const uri = (name) => webview.asWebviewUri(vscode.Uri.joinPath(this.mediaRoot, name)).toString();
+    let html = '';
     try {
-      await streamChat(payload, {
-        signal: this.abort.signal,
-        onEvent: (event, data) => {
-          if (this.state.requestId !== requestId) return;
-          const target = this.state.messages[this.streamingIndex];
-          if (!target) return;
-          switch (event) {
-            case 'meta':
-              this.effectiveModel = `${data.provider}/${data.model}`;
-              break;
-            case 'delta':
-              target.content += String(data.text || '');
-              this.post({ type: 'delta', index: this.streamingIndex, text: String(data.text || '') });
-              break;
-            case 'reasoning':
-              target.reasoning = String(target.reasoning || '') + String(data.text || '');
-              this.post({ type: 'reasoning', index: this.streamingIndex, text: String(data.text || '') });
-              break;
-            case 'usage':
-              target.usage = data;
-              break;
-            case 'finish':
-              finishKind = String(data.kind || '');
-              target.finish = finishKind;
-              if (data.failure?.message) streamError = String(data.failure.message);
-              break;
-            case 'error':
-              streamError = String(data.message || '未知错误');
-              break;
-            default:
-              break;
-          }
-        },
-      });
-    } catch (err) {
-      streamError = String(err?.message || err);
+      html = fs.readFileSync(path.join(this.mediaDir, 'history.html'), 'utf8');
+    } catch {
+      html = '<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:16px">'
+        + 'history.html 缺失，请重装 DSH 编辑器模式扩展。</body>';
     }
+    html = html
+      .replace(/\{\{cspSource\}\}/g, webview.cspSource)
+      .replace(/\{\{nonce\}\}/g, nonce)
+      .replace(/\{\{scriptUri\}\}/g, uri('history.js'))
+      .replace(/\{\{styleUri\}\}/g, uri('history.css'));
+    webview.html = html;
 
-    // 收尾：占位转正、状态归位、落盘。
-    const final = this.state.messages[this.streamingIndex];
-    if (final) {
-      final.pending = false;
-      if (!String(final.content || '').trim() && !streamError) {
-        streamError = finishKind === 'aborted' ? '已停止' : '模型没有返回内容';
-      }
-    }
-    this.state.busy = false;
-    this.state.requestId = '';
-    this.abort = null;
-    this.streamingIndex = -1;
-    if (streamError) this.state.error = streamError;
-    this.trimHistory();
-    this.persist();
+    webview.onDidReceiveMessage((message) => { void this.onMessage(message); });
+    webviewView.onDidChangeVisibility(() => { if (webviewView.visible) void this.refresh(); });
+    webviewView.onDidDispose(() => { if (this.view === webviewView) this.view = null; });
     this.postState();
+    void this.refresh();
   }
 
-  /** 只保留最近 HISTORY_MAX 条，且不切断「user/assistant」配对。 */
-  trimHistory() {
-    const messages = this.state.messages.filter((m) => !m.pending);
-    if (messages.length <= HISTORY_MAX) { this.state.messages = messages; return; }
-    let start = messages.length - HISTORY_MAX;
-    // 若切点落在 assistant 上，往后再丢一条，保证以 user 开始。
-    while (start < messages.length && messages[start].role !== 'user') start++;
-    this.state.messages = messages.slice(start);
+  async onMessage(message) {
+    switch (message?.type) {
+      case 'ready': this.postState(); void this.refresh(); break;
+      case 'refresh': await this.refresh(); break;
+      case 'search': this.query = String(message.q || ''); await this.refresh(); break;
+      case 'open': await this.hooks.openSession(String(message.sessionId || '')); break;
+      default: break;
+    }
   }
+
+  /** 有查询词走 search，否则走 list；两条都覆盖全部工作区。 */
+  async refresh() {
+    this.error = '';
+    try {
+      const path = this.query
+        ? `/editor-sessions/search?q=${encodeURIComponent(this.query)}`
+        : '/editor-sessions/list';
+      const { status, json } = await sessionView.request(channel(), 'GET', path);
+      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      this.items = Array.isArray(json?.items) ? json.items : [];
+      this.postState();
+    } catch (err) {
+      this.error = String(err?.message || err);
+      this.items = [];
+      this.postState();
+    }
+  }
+}
+
+/** 按「今天 / 昨天 / 近 7 天 / 更早」分组，前端直接渲染。 */
+function groupByDay(items) {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const day = 24 * 3600 * 1000;
+  const buckets = [
+    { key: 'today', label: '今天', items: [] },
+    { key: 'yesterday', label: '昨天', items: [] },
+    { key: 'week', label: '近 7 天', items: [] },
+    { key: 'older', label: '更早', items: [] },
+  ];
+  for (const item of Array.isArray(items) ? items : []) {
+    const t = Number(item?.updatedAt) || 0;
+    if (t >= startOfToday) buckets[0].items.push(item);
+    else if (t >= startOfToday - day) buckets[1].items.push(item);
+    else if (t >= startOfToday - 7 * day) buckets[2].items.push(item);
+    else buckets[3].items.push(item);
+  }
+  return buckets.filter((b) => b.items.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +816,14 @@ function formatPayload(file, line, text) {
 function activate(context) {
   // 命令与 webview 都要用，先建单例（视图是按需 resolve 的）。
   const provider = new ChatViewProvider(context, { pushToAgents });
+  const history = new HistoryViewProvider(context, {
+    // 点历史项：切到该会话并聚焦聊天视图
+    openSession: async (sessionId) => {
+      await provider.selectSession(sessionId);
+      const id = provider.visibleViewId() || VIEW_ID;
+      await vscode.commands.executeCommand(`${id}.focus`);
+    },
+  });
 
   const send = (includeSelection) => {
     const data = collect(includeSelection);
@@ -681,8 +859,11 @@ function activate(context) {
     vscode.commands.registerCommand('dshEditorBridge.sendSelection', () => send(true)),
     vscode.commands.registerCommand('dshEditorBridge.sendFile', () => send(false)),
     vscode.commands.registerCommand('dshEditorBridge.askSelection', () => { void askSelection(); }),
+    vscode.window.registerWebviewViewProvider(HISTORY_VIEW_ID, history, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
     vscode.commands.registerCommand('dshEditorBridge.newChat', () => {
-      provider.reset();
+      void provider.newChat();
       void vscode.commands.executeCommand('dshEditor.chat.focus');
     }),
     // 两个容器（左侧活动栏 + 右侧次级侧栏）挂的是同一个视图 id，
@@ -717,4 +898,12 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, formatPayload, parseSseBlock, channel };
+module.exports = {
+  activate,
+  deactivate,
+  formatPayload,
+  parseSseBlock,
+  channel,
+  groupByDay,
+  foldEvents: sessionView.foldEvents,
+};

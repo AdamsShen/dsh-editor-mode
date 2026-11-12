@@ -1,0 +1,48 @@
+:root {
+  --fg: var(--vscode-foreground);
+  --bg: var(--vscode-sideBar-background, transparent);
+  --muted: var(--vscode-descriptionForeground);
+  --hover: var(--vscode-list-hoverBackground);
+  --border: var(--vscode-panel-border, rgba(128,128,128,.25));
+  --accent: var(--vscode-focusBorder);
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font: 12px/1.5 var(--vscode-font-family, system-ui, sans-serif);
+}
+.topbar { display: flex; gap: 4px; padding: 6px; position: sticky; top: 0; background: var(--bg); z-index: 2; }
+.topbar input {
+  flex: 1; min-width: 0; padding: 4px 6px;
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 3px; outline: none;
+}
+.topbar input:focus { border-color: var(--accent); }
+.topbar button {
+  padding: 3px 8px; cursor: pointer; color: var(--fg);
+  background: var(--vscode-button-secondaryBackground, transparent);
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.list { padding: 0 4px 12px; }
+.group-title {
+  padding: 8px 6px 4px; color: var(--muted);
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em;
+}
+.row {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 5px 6px; border-radius: 3px; cursor: pointer;
+}
+.row:hover { background: var(--hover); }
+.row .title {
+  color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.row .meta {
+  color: var(--muted); font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.row .snippet { color: var(--muted); font-size: 11px; opacity: .85; }
+.row .dir { opacity: .75; }
+.badge { color: var(--muted); font-size: 11px; }
+.empty, .error { padding: 12px 10px; color: var(--muted); }
+.error { color: var(--vscode-errorForeground, #d33); }

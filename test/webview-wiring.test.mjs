@@ -90,10 +90,12 @@ check('activationEvents 覆盖视图与命令',
 console.log('webview 与扩展消息协议');
 const posted = [...new Set([...chatSrc.matchAll(/type:\s*'([a-zA-Z]+)'/g)].map((m) => m[1]))];
 const handled = [...new Set([...extensionSrc.matchAll(/case '([a-zA-Z]+)':/g)].map((m) => m[1]))];
-for (const type of ['ready', 'send', 'stop', 'selectModel', 'toggleContext', 'newChat', 'escalate', 'refreshModels']) {
+// 2026-11 协议：模型选择与上下文开关并入会话本身（Agent 自己读文件），
+// escalate 删除（Chat 本身就是 Agent），新增会话切换/重命名/列表。
+for (const type of ['ready', 'send', 'stop', 'newChat', 'selectSession', 'renameSession', 'openFile']) {
   check(`webview 发出 ${type}，扩展有处理`, posted.includes(type) && handled.includes(type));
 }
-for (const type of ['state', 'delta', 'reasoning', 'prefill', 'contextInfo']) {
+for (const type of ['state', 'append', 'reasoning', 'prefill', 'contextInfo', 'sessions']) {
   check(`扩展会推 ${type}，webview 有处理`, chatSrc.includes(`case '${type}':`));
 }
 

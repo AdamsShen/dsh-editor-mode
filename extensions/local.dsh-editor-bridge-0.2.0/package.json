@@ -2,7 +2,7 @@
   "name": "dsh-editor-bridge",
   "displayName": "DSH Editor Bridge",
   "description": "在 VS Code 侧栏里直接和 DSH 对话（复用 DSH 配置的模型），并把选区发给 DSH Agents",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -37,17 +37,26 @@
       "dshEditor": [
         {
           "id": "dshEditor.chat",
-          "type": "webview",
-          "name": "DSH Chat",
-          "contextualTitle": "DSH Chat"
+          "name": "Chat",
+          "type": "webview"
+        },
+        {
+          "id": "dshEditor.history",
+          "name": "历史会话",
+          "type": "webview"
         }
       ],
       "dshEditorSecondary": [
         {
           "id": "dshEditor.chat",
+          "name": "Chat",
           "type": "webview",
-          "name": "DSH Chat",
-          "contextualTitle": "DSH Chat"
+          "initialSize": 1
+        },
+        {
+          "id": "dshEditor.history",
+          "name": "历史会话",
+          "type": "webview"
         }
       ]
     },

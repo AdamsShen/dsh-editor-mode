@@ -1,14 +1,21 @@
 /*
  * DSH Chat 侧栏前端（webview）。
  *
- * 职责边界：这里只做「显示 + 收集输入」，所有模型调用、持久化、上下文收集
- * 都在扩展的 Node 侧（extension.js）。webview 与扩展之间只传消息，
- * 不直接访问网络（CSP 也不允许），因此不会有第二次鉴权问题。
+ * 定位变更（2026-11）：这里显示的**不再是独立纯模型对话**，而是 DSH 真实
+ * Agent 会话（双模式 X 的编辑器侧视图）。所以会出现工具调用卡片。
+ *
+ * 职责边界：只做「渲染 + 收集输入」，所有会话操作都在扩展的 Node 侧。
+ * webview 不直接联网（CSP 也不允许），避免第二次鉴权。
  *
  * 消息协议：
- *   发往扩展：ready / send / stop / selectModel / toggleContext / newChat
- *             / escalate{index} / refreshModels / openFile{path,line}
- *   来自扩展：state（全量）/ delta / reasoning / contextInfo / prefill
+ *   发往扩展：ready / send / stop / newChat / selectSession / renameSession
+ *             / listSessions / openFile
+ *   来自扩展：state（全量）/ append / reasoning / sessions / prefill / contextInfo
+ *
+ * 消息模型（由扩展侧折叠，前端只渲染）：
+ *   { role:'user'|'assistant',
+ *     reasoning: string,
+ *     parts: [ {type:'text', text} | {type:'tool', callId, name, summary, result, status} ] }
  */
 
 (function () {
@@ -20,38 +27,33 @@
   const sendBtn = $('send');
   const stopBtn = $('stop');
   const errEl = $('error');
-  const modelEl = $('model');
-  const ctxBtn = $('ctx');
+  const sessionEl = $('session');
+  const renameBtn = $('rename');
+  const newBtn = $('new');
   const ctxInfoEl = $('ctxinfo');
   const hintEl = $('hint');
   const emptyEl = $('empty');
 
-  /** 与扩展同步的会话状态。 */
   const state = {
+    sessionId: '',
+    sessionTitle: '',
     messages: [],
-    models: null,
-    provider: '',
-    model: '',
     busy: false,
     error: '',
-    contextEnabled: true,
     contextLabel: '',
     hasEditor: false,
-    effectiveModel: '',
+    sessions: [],
   };
 
-  /** 正在等待重绘的消息下标（用 rAF 合并高频 delta）。 */
   const dirty = new Set();
   let rafId = 0;
 
   // ---------------------------------------------------------------- 工具
 
-  /** Markdown 渲染委托给 media/markdown.js（纯函数，可单独测试）。 */
   function renderMarkdown(source) {
     return window.DshMarkdown.render(source);
   }
 
-  /** 草稿区随内容长高，最多到 CSS 的 max-height。 */
   function autoGrow() {
     inputEl.style.height = 'auto';
     inputEl.style.height = `${Math.min(inputEl.scrollHeight, Math.round(window.innerHeight * 0.4))}px`;
@@ -61,23 +63,62 @@
     return logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 48;
   }
 
-  function scrollToBottom() {
-    logEl.scrollTop = logEl.scrollHeight;
+  function scrollToBottom() { logEl.scrollTop = logEl.scrollHeight; }
+
+  /** 取消息里的纯文字（用于复制）。 */
+  function textOf(message) {
+    return (message.parts || [])
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('\n');
   }
 
   // ---------------------------------------------------------------- 渲染
+
+  /** 工具调用卡片：一行摘要，点开看参数与结果。 */
+  function toolNode(part) {
+    const details = document.createElement('details');
+    details.className = 'tool';
+    details.dataset.status = part.status || 'done';
+
+    const summary = document.createElement('summary');
+    const name = document.createElement('span');
+    name.className = 'tool-name';
+    name.textContent = part.name || '工具';
+    summary.appendChild(name);
+
+    if (part.summary) {
+      const arg = document.createElement('span');
+      arg.className = 'tool-arg';
+      arg.textContent = part.summary;
+      summary.appendChild(arg);
+    }
+
+    const status = document.createElement('span');
+    status.className = 'tool-status';
+    status.textContent = part.status === 'running' ? '执行中…'
+      : part.status === 'error' ? '失败' : '完成';
+    summary.appendChild(status);
+    details.appendChild(summary);
+
+    if (part.result) {
+      const pre = document.createElement('pre');
+      pre.className = 'tool-result';
+      pre.textContent = part.result;
+      details.appendChild(pre);
+    }
+    return details;
+  }
 
   function messageNode(message, index) {
     const el = document.createElement('div');
     el.className = 'msg';
     el.dataset.role = message.role;
     el.dataset.index = String(index);
-    if (message.pending) el.dataset.pending = 'true';
 
     const role = document.createElement('div');
     role.className = 'msg-role';
     role.textContent = message.role === 'user' ? '你' : 'DSH';
-    if (message.role === 'assistant' && message.pending) role.textContent = 'DSH · 生成中';
     el.appendChild(role);
 
     if (message.reasoning) {
@@ -93,39 +134,64 @@
       el.appendChild(details);
     }
 
-    const body = document.createElement('div');
-    body.className = 'msg-body';
-    body.innerHTML = renderMarkdown(message.content);
-    el.appendChild(body);
-
-    // 用户点了「停止」：在消息尾部留一个明确的痕迹，避免半句话看起来像模型出错。
-    if (message.finish === 'aborted') {
-      const note = document.createElement('div');
-      note.className = 'msg-note';
-      note.textContent = '（已停止生成）';
-      el.appendChild(note);
+    for (const part of message.parts || []) {
+      if (part.type === 'tool') {
+        el.appendChild(toolNode(part));
+        continue;
+      }
+      if (part.type !== 'text' || !String(part.text || '').trim()) continue;
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      body.innerHTML = renderMarkdown(part.text);
+      // 文本里出现的 file:line 做成可点击（点击交给扩展打开文件）
+      decorateFileRefs(body);
+      el.appendChild(body);
     }
 
-    const actions = document.createElement('div');
-    actions.className = 'msg-actions';
-    if (message.role === 'assistant') {
-      const escalate = document.createElement('button');
-      escalate.type = 'button';
-      escalate.textContent = '→ Agents';
-      escalate.title = '把这条回复交给 DSH Agents，让它真正改代码';
-      escalate.dataset.act = 'escalate';
-      escalate.dataset.index = String(index);
-      actions.appendChild(escalate);
+    if (message.role === 'assistant' && textOf(message).trim()) {
+      const actions = document.createElement('div');
+      actions.className = 'msg-actions';
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.textContent = '复制';
+      copy.dataset.act = 'copy';
+      copy.dataset.index = String(index);
+      actions.appendChild(copy);
+      el.appendChild(actions);
     }
-    const copy = document.createElement('button');
-    copy.type = 'button';
-    copy.textContent = '复制';
-    copy.dataset.act = 'copy';
-    copy.dataset.index = String(index);
-    actions.appendChild(copy);
-    el.appendChild(actions);
-
     return el;
+  }
+
+  /**
+   * 把正文里形如 `path/to/file.ts:42` 的文本标成可点击。
+   * 只处理纯文本节点，避免破坏已渲染的 Markdown 结构。
+   */
+  function decorateFileRefs(root) {
+    const pattern = /([\w./-]+\.\w{1,8}):(\d+)/g;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const targets = [];
+    while (walker.nextNode()) targets.push(walker.currentNode);
+    for (const node of targets) {
+      const text = node.nodeValue || '';
+      if (!pattern.test(text)) continue;
+      pattern.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index > last) frag.appendChild(document.createTextNode(text.slice(last, match.index)));
+        const link = document.createElement('a');
+        link.href = '#';
+        link.className = 'file-ref';
+        link.dataset.file = match[1];
+        link.dataset.line = match[2];
+        link.textContent = match[0];
+        frag.appendChild(link);
+        last = match.index + match[0].length;
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
   }
 
   function fullRender() {
@@ -141,15 +207,13 @@
     if (stick) scrollToBottom();
   }
 
-  /** 只重绘一条消息（流式追加时用，避免整列表重建导致抖动）。 */
   function renderOne(index) {
     const message = state.messages[index];
     if (!message) return;
     const old = logEl.querySelector(`.msg[data-index="${index}"]`);
     if (!old) { fullRender(); return; }
     const stick = nearBottom();
-    const fresh = messageNode(message, index);
-    old.replaceWith(fresh);
+    old.replaceWith(messageNode(message, index));
     if (stick) scrollToBottom();
   }
 
@@ -165,193 +229,155 @@
     });
   }
 
-  function renderModels() {
-    const current = `${state.provider}\u0001${state.model}`;
-    modelEl.textContent = '';
-    const models = state.models;
-    const providers = (models && models.providers) || [];
-    let hasOptions = false;
+  /** 会话切换器：当前会话 + 最近会话列表。 */
+  function renderSessions() {
+    sessionEl.textContent = '';
+    const current = document.createElement('option');
+    current.value = state.sessionId || '';
+    current.textContent = state.sessionTitle
+      || (state.sessionId ? state.sessionId.slice(0, 12) : '新会话');
+    sessionEl.appendChild(current);
 
-    for (const provider of providers) {
-      const list = provider.models || [];
-      if (!list.length) continue;
+    const others = state.sessions.filter((s) => s.id !== state.sessionId);
+    if (others.length) {
       const group = document.createElement('optgroup');
-      group.label = provider.name || provider.id;
-      for (const model of list) {
-        const option = document.createElement('option');
-        option.value = `${provider.id}\u0001${model.id}`;
-        option.textContent = model.name || model.id;
-        if (option.value === current) option.selected = true;
-        group.appendChild(option);
-        hasOptions = true;
+      group.label = '最近会话';
+      for (const item of others) {
+        const opt = document.createElement('option');
+        opt.value = item.id;
+        opt.textContent = item.title || shortDir(item.cwd) || item.id.slice(0, 12);
+        group.appendChild(opt);
       }
-      modelEl.appendChild(group);
-    }
-
-    if (!hasOptions) {
-      const option = document.createElement('option');
-      option.textContent = state.provider ? `${state.provider}/${state.model}` : '模型列表未就绪';
-      modelEl.appendChild(option);
-      modelEl.disabled = true;
-      return;
-    }
-    modelEl.disabled = false;
-    // 当前选择不在列表里（比如模型被删了）：补一个禁用项，避免 select 空白。
-    if (current && !modelEl.value) {
-      const option = document.createElement('option');
-      option.value = current;
-      option.textContent = `${state.provider}/${state.model}（不可用）`;
-      option.selected = true;
-      modelEl.insertBefore(option, modelEl.firstChild);
+      sessionEl.appendChild(group);
     }
   }
 
-  function syncControls() {
-    sendBtn.disabled = state.busy;
-    stopBtn.hidden = !state.busy;
+  function shortDir(cwd) {
+    if (!cwd) return '';
+    return String(cwd).split(/[\\/]/).filter(Boolean).slice(-2).join('/');
+  }
+
+  function renderStatus() {
     errEl.hidden = !state.error;
-    errEl.textContent = state.error || '';
-    ctxBtn.setAttribute('aria-pressed', String(state.contextEnabled));
-    ctxInfoEl.textContent = state.contextEnabled
-      ? (state.hasEditor ? state.contextLabel : '未打开文件')
-      : '不带上下文';
-    hintEl.textContent = state.busy
-      ? '正在生成…'
-      : (state.effectiveModel ? `模型：${state.effectiveModel}` : '');
-    if (!state.messages.length) inputEl.placeholder = '问点什么…（Enter 发送，Shift+Enter 换行）';
+    if (state.error) errEl.textContent = state.error;
+
+    stopBtn.hidden = !state.busy;
+    sendBtn.disabled = state.busy;
+    sendBtn.textContent = state.busy ? '运行中…' : '发送';
+    inputEl.placeholder = state.busy
+      ? 'DSH 正在干活…可以先输入，等这轮结束再发'
+      : '让 DSH 改点什么…（Enter 发送，Shift+Enter 换行）';
+
+    ctxInfoEl.textContent = state.contextLabel || '';
+    hintEl.textContent = state.sessionId ? '' : '首次发送会自动新建会话';
   }
 
-  // ---------------------------------------------------------------- 交互
+  // ---------------------------------------------------------------- 事件
 
-  function submit() {
+  function onSubmit() {
     const text = inputEl.value.trim();
     if (!text || state.busy) return;
-    // 乐观置忙，避免连点两次发出两轮；扩展随后会用 state 覆盖。
-    state.busy = true;
-    syncControls();
     vscode.postMessage({ type: 'send', text });
     inputEl.value = '';
     autoGrow();
   }
 
-  function sendStop() {
-    vscode.postMessage({ type: 'stop' });
-  }
-
-  // 消息区事件委托：复制 / 交回 Agents。
-  logEl.addEventListener('click', (event) => {
-    const button = event.target.closest('button[data-act]');
-    if (!button) return;
-    const index = Number(button.dataset.index);
-    if (button.dataset.act === 'copy') {
-      const message = state.messages[index];
-      const text = message ? String(message.content || '') : '';
-      if (text) navigator.clipboard.writeText(text);
-      return;
-    }
-    if (button.dataset.act === 'escalate') {
-      vscode.postMessage({ type: 'escalate', index });
-    }
+  sendBtn.addEventListener('click', onSubmit);
+  stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+  newBtn.addEventListener('click', () => vscode.postMessage({ type: 'newChat' }));
+  renameBtn.addEventListener('click', () => {
+    const title = window.prompt('会话标题', state.sessionTitle || '');
+    if (title && title.trim()) vscode.postMessage({ type: 'renameSession', title: title.trim() });
   });
-
-  // 代码块复制按钮在 Markdown 生成后才有，同样用委托。
-  logEl.addEventListener('click', (event) => {
-    const button = event.target.closest('button.copy[data-code]');
-    if (!button) return;
-    const code = decodeURIComponent(button.dataset.code || '');
-    if (!code) return;
-    navigator.clipboard.writeText(code);
-    const previous = button.textContent;
-    button.textContent = '已复制';
-    setTimeout(() => { button.textContent = previous; }, 1200);
-  });
-
-  sendBtn.addEventListener('click', submit);
-  stopBtn.addEventListener('click', sendStop);
-  $('new').addEventListener('click', () => vscode.postMessage({ type: 'newChat' }));
-  $('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refreshModels' }));
-
-  ctxBtn.addEventListener('click', () => {
-    vscode.postMessage({ type: 'toggleContext', enabled: !state.contextEnabled });
-  });
-
-  modelEl.addEventListener('change', () => {
-    const [provider, model] = String(modelEl.value || '').split('\u0001');
-    if (!provider || !model) return;
-    vscode.postMessage({ type: 'selectModel', provider, model });
+  sessionEl.addEventListener('change', () => {
+    const id = sessionEl.value;
+    if (id && id !== state.sessionId) vscode.postMessage({ type: 'selectSession', sessionId: id });
   });
 
   inputEl.addEventListener('input', autoGrow);
   inputEl.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter') return;
-    if (event.shiftKey || event.isComposing) return;
-    event.preventDefault();
-    submit();
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      onSubmit();
+    }
   });
 
-  // 点击消息里的 `path/to/file.ts:12` 打开文件（只在行号存在时）。
   logEl.addEventListener('click', (event) => {
-    if (event.target.closest('a, button')) return;
-    const selection = window.getSelection();
-    const word = selection && String(selection).trim();
-    if (!word || word.length > 200) return;
-    const match = /^([\w./@-]+\.[\w]+):(\d+)$/.exec(word);
-    if (!match) return;
-    vscode.postMessage({ type: 'openFile', path: match[1], line: Number(match[2]) });
+    const link = event.target.closest?.('.file-ref');
+    if (link) {
+      event.preventDefault();
+      vscode.postMessage({
+        type: 'openFile',
+        path: link.dataset.file,
+        line: Number(link.dataset.line) || 1,
+      });
+      return;
+    }
+    const btn = event.target.closest?.('button[data-act]');
+    if (!btn) return;
+    if (btn.dataset.act === 'copy') {
+      const message = state.messages[Number(btn.dataset.index)];
+      if (message) void navigator.clipboard.writeText(textOf(message));
+    }
   });
 
   window.addEventListener('message', (event) => {
-    const message = event.data || {};
-    switch (message.type) {
-      case 'state': {
-        state.messages = message.messages || [];
-        state.models = message.models || null;
-        state.provider = message.provider || '';
-        state.model = message.model || '';
-        state.busy = Boolean(message.busy);
-        state.error = message.error || '';
-        state.contextEnabled = message.contextEnabled !== false;
-        state.contextLabel = message.contextLabel || '';
-        state.hasEditor = Boolean(message.hasEditor);
-        state.effectiveModel = message.effectiveModel || state.effectiveModel;
-        renderModels();
+    const msg = event.data || {};
+    switch (msg.type) {
+      case 'state':
+        state.sessionId = msg.sessionId || '';
+        state.sessionTitle = msg.sessionTitle || '';
+        state.messages = Array.isArray(msg.messages) ? msg.messages : [];
+        state.busy = Boolean(msg.busy);
+        state.error = msg.error || '';
+        state.contextLabel = msg.contextLabel || '';
+        state.hasEditor = Boolean(msg.hasEditor);
+        renderSessions();
+        renderStatus();
         fullRender();
-        syncControls();
         break;
-      }
-      case 'delta': {
-        const target = state.messages[message.index];
-        if (!target) break;
-        target.content = String(target.content || '') + String(message.text || '');
-        scheduleRender(message.index);
+      case 'append': {
+        // 增量就地追加到本地模型（与扩展侧的折叠规则一致），只重绘这一条，
+        // 避免整列表重建导致滚动抖动。
+        const idx = Number(msg.index);
+        const target = state.messages[idx];
+        if (target) {
+          const last = target.parts[target.parts.length - 1];
+          if (last && last.type === 'text') last.text += String(msg.text || '');
+          else target.parts.push({ type: 'text', text: String(msg.text || '') });
+        }
+        scheduleRender(idx);
+        renderStatus();
         break;
       }
       case 'reasoning': {
-        const target = state.messages[message.index];
-        if (!target) break;
-        target.reasoning = String(target.reasoning || '') + String(message.text || '');
-        scheduleRender(message.index);
+        const idx = Number(msg.index);
+        const target = state.messages[idx];
+        if (target) target.reasoning += String(msg.text || '');
+        scheduleRender(idx);
         break;
       }
-      case 'contextInfo': {
-        state.contextLabel = message.label || '';
-        state.hasEditor = Boolean(message.hasEditor);
-        syncControls();
+      case 'sessions':
+        state.sessions = Array.isArray(msg.items) ? msg.items : [];
+        renderSessions();
         break;
-      }
-      case 'prefill': {
-        inputEl.value = String(message.text || '');
+      case 'contextInfo':
+        state.contextLabel = msg.label || '';
+        state.hasEditor = Boolean(msg.hasEditor);
+        renderStatus();
+        break;
+      case 'prefill':
+        inputEl.value = String(msg.text || '');
         autoGrow();
         inputEl.focus();
-        inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
         break;
-      }
       default:
         break;
     }
   });
 
-  // 启动：先让扩展推一次全量状态。
+  renderStatus();
+  renderSessions();
+  fullRender();
   vscode.postMessage({ type: 'ready' });
-  syncControls();
 }());

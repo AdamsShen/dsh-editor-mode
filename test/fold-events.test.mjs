@@ -1,0 +1,125 @@
+/**
+ * 测试：会话事件折叠（session-view.js 的 foldEvents）。
+ *
+ * 为什么单独测：历史加载与实时增量**共用同一套折叠规则**，
+ * 一旦两边不一致，就会出现「刚聊完」和「重新打开」显示不同的经典问题。
+ *
+ * 用法：node test/fold-events.test.mjs
+ */
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { foldEvents, summarizeToolResult, formatArgs } = require('../extensions/local.dsh-editor-bridge-0.2.0/session-view.js');
+
+let failed = 0;
+function check(name, condition, detail) {
+  if (condition) console.log('  ✓', name);
+  else { failed += 1; console.log('  ✗', name, detail ? `\n      ${detail}` : ''); }
+}
+
+// 真实形状（实测 DSH 0.2.2-rc.1）：内容直接在 data.content，source.kind 区分真人输入
+const userEvent = (text, kind = 'user') => ({
+  type: 'user/message',
+  data: { content: [{ type: 'text', text }], source: { kind }, role: 'user' },
+});
+const assistantEvent = (content) => ({ type: 'assistant/message', data: { message: { content } } });
+
+console.log('基本对话');
+{
+  const messages = foldEvents([userEvent('你好'), assistantEvent([{ type: 'text', text: '在的' }])]);
+  check('两条消息', messages.length === 2, String(messages.length));
+  check('角色正确', messages[0].role === 'user' && messages[1].role === 'assistant');
+  check('用户文字', messages[0].parts[0].text === '你好');
+  check('助手文字', messages[1].parts[0].text === '在的');
+}
+
+console.log('工具调用 → 卡片');
+{
+  const messages = foldEvents([
+    userEvent('看下 README'),
+    // 助手先发起工具调用（DSH 把 tool-call 放在 assistant/message 的 content 块里）
+    assistantEvent([
+      { type: 'text', text: '我读一下。' },
+      { type: 'tool-call', id: 'call-1', name: 'read_file', arguments: { path: 'README.md' } },
+    ]),
+    // 结果单独成事件，靠 callId 回填到同一张卡
+    { type: 'tool/result', data: { message: { source: { callId: 'call-1' }, content: [{ type: 'text', text: '# 标题' }] } } },
+  ]);
+  const parts = messages[1].parts;
+  check('有文字 + 工具两块', parts.length === 2, JSON.stringify(parts.map((p) => p.type)));
+  const tool = parts.find((p) => p.type === 'tool');
+  check('工具名正确', tool.name === 'read_file');
+  check('参数压成一行且含路径', tool.summary.includes('README.md'), tool.summary);
+  check('结果被回填', tool.result === '# 标题', JSON.stringify(tool.result));
+  check('状态从 running 转 done', tool.status === 'done', tool.status);
+}
+
+console.log('工具失败');
+{
+  const messages = foldEvents([
+    assistantEvent([{ type: 'tool-call', id: 'c2', name: 'run', arguments: 'ls' }]),
+    { type: 'tool/result', data: { message: { source: { callId: 'c2' }, isError: true, content: 'ENOENT' } } },
+  ]);
+  const tool = messages[0].parts.find((p) => p.type === 'tool');
+  check('失败状态标 error', tool.status === 'error', tool.status);
+  check('错误内容保留', tool.result === 'ENOENT');
+}
+
+console.log('turn/end 收尾');
+{
+  // 只有 tool/call 没有 result 时，turn 结束不能让它一直转圈
+  const messages = foldEvents([
+    assistantEvent([{ type: 'tool-call', id: 'c3', name: 'grep', arguments: 'TODO' }]),
+    { type: 'turn/end', data: {} },
+  ]);
+  const tool = messages[0].parts.find((p) => p.type === 'tool');
+  check('未回收的工具被标 done', tool.status === 'done', tool.status);
+}
+
+console.log('多轮与思考过程');
+{
+  const messages = foldEvents([
+    userEvent('一'),
+    assistantEvent([{ type: 'reasoning', text: '想想' }, { type: 'text', text: '一答' }]),
+    userEvent('二'),
+    assistantEvent([{ type: 'text', text: '二答' }]),
+  ]);
+  check('四段消息', messages.length === 4, String(messages.length));
+  check('思考单独存字段', messages[1].reasoning === '想想', messages[1].reasoning);
+  check('第二轮问题归属正确', messages[2].parts[0].text === '二');
+  check('第二轮回答握在新消息里', messages[3].parts[0].text === '二答');
+}
+
+console.log('DSH 注入的伪用户消息要挡掉');
+{
+  // 这三种 source.kind 都是 DSH 自己塞给模型的上下文，渲染出来只会是噪音
+  const messages = foldEvents([
+    userEvent('真正的问题'),
+    userEvent('Current runtime context...', 'runtime-context'),
+    userEvent('<system-reminder>…', 'skill-catalog'),
+    userEvent('Time sampled…', 'time-context'),
+    assistantEvent([{ type: 'text', text: '答' }]),
+  ]);
+  check('只保留真人输入', messages.length === 2, String(messages.length));
+  check('真人内容正确', messages[0].parts[0].text === '真正的问题');
+}
+
+console.log('容错');
+{
+  check('空数组', foldEvents([]).length === 0);
+  check('非数组不炸', foldEvents(null).length === 0);
+  check('未知事件被忽略', foldEvents([{ type: 'whatever/x', data: {} }]).length === 0);
+  check('缺 data 不炸', foldEvents([{ type: 'tool/result' }]).length === 0);
+  const partial = foldEvents([{ type: 'assistant/message', data: {} }]);
+  check('缺 content 产生空助手消息', partial.length === 1 && partial[0].parts.length === 0);
+}
+
+console.log('辅助函数');
+{
+  check('超长结果被截断', summarizeToolResult('x'.repeat(9000)).includes('已截断'));
+  check('短结果原样返回', summarizeToolResult('ok') === 'ok');
+  check('参数对象序列化', formatArgs({ a: 1 }).includes('"a":1'));
+  check('超长参数截断', formatArgs({ s: 'y'.repeat(600) }).endsWith('…'));
+}
+
+console.log(failed === 0 ? 'PASS: 折叠规则自洽' : `FAIL: ${failed} 项失败`);
+process.exit(failed ? 1 : 0);
