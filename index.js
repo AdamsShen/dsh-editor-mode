@@ -201,6 +201,18 @@ async function startServer(config, ctx, bridge) {
     // 编辑器内 Chat 用的基址 + token；留空时扩展会回退读 runtimeDir/bridge.json。
     DSH_EDITOR_BASE: bridge?.base || '',
     DSH_EDITOR_TOKEN: bridge?.token || '',
+    // 让 VS Code 完全不加载指定内置扩展。
+    //
+    // 为什么不是写 settings.json：code-server 发行包内置 GitHub Copilot Chat
+    // （product.json 的 builtInExtensionsEnabledWithAutoUpdates），它不属于 user
+    // 扩展，`github.copilot.enable:false` 只关掉补全，右侧 Chat 视图照样注册，
+    // 用户就会看到一个要登录 GitHub 的面板 —— 与 DSH 的模型配置毫无关系。
+    //
+    // 内置扩展只能靠这个环境变量跳过（server-main.js 的 scanSystemExtensions 读取
+    // environmentService.skipBuiltinExtensions），code-server 的 CLI 不转发
+    // `--disable-extension`。设置后 VS Code 内部会把该扩展标记为「已禁用」，
+    // 正好符合「用 DSH Chat 替换掉它」的预期。
+    VSCODE_SKIP_BUILTIN_EXTENSIONS: (config.skipBuiltinExtensions ?? ['GitHub.copilot-chat']).join(','),
   };
   const child = spawn(nodeBin, args, {
     cwd: runtimeDir,

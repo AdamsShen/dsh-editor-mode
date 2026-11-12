@@ -54,6 +54,7 @@ npm install code-server@4.145.2
 | `bridgeToken` | `''` | 桥接 / 对话端点 token；留空每次启动随机生成 |
 | `userDataDir` | `~/.dsh/editor-runtime/user-data` | code-server 独立 user-data-dir（不污染全局配置） |
 | `editorSettings` | `{}` | 覆盖写入编辑器的默认设置 |
+| `skipBuiltinExtensions` | `['GitHub.copilot-chat']` | 不加载的内置扩展；设成 `[]` 可恢复 code-server 默认行为 |
 
 ## 三块能力
 
@@ -161,8 +162,9 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
   放行，仅监听 `127.0.0.1`。
 - 无 Config schema、无运行时自动下载/校验、无崩溃自动重启。
 - 全局快捷键、下载、扩展 webview 在 iframe 内可能有损耗。
-- code-server 发行包内置的 GitHub Copilot Chat 已通过独立 user-data-dir 的默认设置关闭；
-  若残留，就是那条设置被用户改回来了。
+- code-server 发行包内置的 GitHub Copilot Chat **不再加载**（`VSCODE_SKIP_BUILTIN_EXTENSIONS`，
+  由 `skipBuiltinExtensions` 配置控制）。它占的右侧 Chat 面板由 DSH Chat 侧栏替代；
+  注意 `github.copilot.enable:false` 只能关补全，关不掉那个视图。
 - 侧栏 Chat 不带工具、不共享 DSH 会话历史（它是独立线程）；需要 Agent 能力请走「→ Agents」。
 - 输入框注入依赖 `conversation.input` facade 的 `setDraft`，DSH 升级若改契约需同步适配。
 - **不要直接访问未在 `inject` 声明的 cordis 服务**（如 `ctx.uiWorkspace`）：会抛

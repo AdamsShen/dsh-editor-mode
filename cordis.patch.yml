@@ -12,3 +12,9 @@
         nodeBin: ''
         # 打开的项目目录。留空则回退到当前 Session 的 workingDirectory。
         workspaceDir: ''
+        # 不加载的内置扩展（大小写不敏感）。
+        # code-server 内置的 GitHub Copilot Chat 会占掉右侧 Chat 面板并要求登录 GitHub，
+        # 与 DSH 的模型配置无关；编辑器内对话统一走自带的 DSH Chat 侧栏。
+        # 留空数组可恢复 code-server 的默认行为。
+        skipBuiltinExtensions:
+          - GitHub.copilot-chat
