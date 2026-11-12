@@ -25,6 +25,9 @@ window.__ModuleLoader__.load({
 
     const NS = '@local/dsh-editor-mode';
     const PANEL_ID = 'editor';
+    /** 加载超时阈值：超过这个时间还没收到 onLoad，就认为 iframe 是白的并展示可操作提示。 */
+    const STALL_MS = 12000;
+
     // 兜底地址：Host 未就绪时仍能用（端口与 config.upstreamPort 一致）。
     // 面板挂载后会从 /editor-status 读取真实 upstream 并替换，避免硬编码漂移。
     const FALLBACK_EDITOR_URL = 'http://127.0.0.1:3999/';
@@ -63,6 +66,7 @@ window.__ModuleLoader__.load({
         flex-direction:column;gap:8px;font-size:13px;color:var(--dsw-alias-fg-secondary,#888);
         background:var(--dsw-alias-bg-canvas,#fff);}
       .dem-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-fg-tertiary,#bbb);}
+      .dem-hint{font-size:11px;opacity:.65;max-width:60ch;text-align:center;line-height:1.6;}
     `;
 
     function Style() {
@@ -152,7 +156,11 @@ window.__ModuleLoader__.load({
     function EditorPanel({ layout, uiWorkspace }) {
       const [nonce, setNonce] = useState(0);
       const [loaded, setLoaded] = useState(false);
+      const [stalled, setStalled] = useState(false);
       const [info, setInfo] = useState(null);   // { upstream, workspace, folder, status } | null
+      // Host 半边是否可达。false 表示 /editor-status 404 —— 即 Host 插件没被加载，
+      // 这时 iframe 一定是白屏，必须把它说清楚，而不是让用户对着白板猜。
+      const [hostOk, setHostOk] = useState(true);
       const [folder, setFolder] = useState('');  // 当前打开的目录；空 = 用 Host 默认值
 
       useEffect(() => {
@@ -161,7 +169,13 @@ window.__ModuleLoader__.load({
         (async () => {
           try {
             const r = await fetch('/editor-status', { signal: ctrl.signal });
-            if (!r.ok) return;
+            if (!r.ok) {
+              // 404 = Host 路由根本没注册（插件 Host 半边未加载）；
+              // 401 = 已注册但当前页面没通过鉴权。两种都不该继续等白屏。
+              if (alive && r.status === 404) setHostOk(false);
+              return;
+            }
+            if (alive) setHostOk(true);
             const j = await r.json();
             if (alive && j?.upstream) {
               setInfo(j);
@@ -173,7 +187,21 @@ window.__ModuleLoader__.load({
         return () => { alive = false; ctrl.abort(); };
       }, [nonce]);
 
-      const reload = useCallback(() => { setLoaded(false); setNonce((n) => n + 1); }, []);
+      const reload = useCallback(() => {
+        setLoaded(false);
+        setStalled(false);
+        setNonce((n) => n + 1);
+      }, []);
+
+      // 看门狗：iframe 的 onLoad 在「页面加载了但是白屏」时也会触发，
+      // 真正可靠的判断是「有没有拿到过 workbench」。这里只在长时间没加载完时
+      // 给出一条可操作提示，不隐藏 iframe（避免误判把正常页面盖住）。
+      useEffect(() => {
+        setStalled(false);
+        if (loaded) return undefined;
+        const timer = setTimeout(() => setStalled(true), STALL_MS);
+        return () => clearTimeout(timer);
+      }, [loaded, nonce, info?.upstream]);
 
       // 「打开目录」：调用 DSH 的目录选择器，之后只改 iframe 的 ?folder= 参数。
       const openDirectory = useCallback(async () => {
@@ -215,10 +243,26 @@ window.__ModuleLoader__.load({
           allow: 'clipboard-read; clipboard-write; fullscreen',
           onLoad: () => setLoaded(true),
         }),
-        !loaded ? h('div', { className: 'dem-state' },
-          h('span', { className: 'dem-dot' }),
-          h('span', null, '正在连接编辑器…'),
-          h('span', { style: { fontSize: 11, opacity: .6 } }, label)) : null);
+        // Host 路由不存在 = 插件 Host 半边没加载，iframe 必然是白的。
+        // 这种故障必须直说，并把排查线索给全（否则用户只能对着白板猜）。
+        !hostOk ? h('div', { className: 'dem-state' },
+          h('span', { style: { fontSize: 13, fontWeight: 600 } }, '编辑器后端未启动'),
+          h('span', { className: 'dem-hint' },
+            '/editor-status 返回 404 —— 宿主插件（editor-mode）的 Host 半边没有加载。'),
+          h('span', { className: 'dem-hint' },
+            '常见原因：DSH 刚升级/重启过、插件被禁用，或插件加载时抛错。'),
+          h('button', {
+            className: 'dem-btn', type: 'button',
+            onClick: () => { setLoaded(false); setNonce((n) => n + 1); },
+          }, '重试'))
+          : (!loaded ? h('div', { className: 'dem-state' },
+            h('span', { className: 'dem-dot' }),
+            h('span', null, stalled ? '编辑器仍未就绪' : '正在连接编辑器…'),
+            h('span', { className: 'dem-hint' }, label),
+            stalled ? h('span', { className: 'dem-hint' },
+              '若长时间空白：点「重载」；仍不行说明 code-server 没起来（见 README 排查）。') : null,
+            stalled ? h('button', { className: 'dem-btn', type: 'button', onClick: reload }, '重载') : null,
+          ) : null));
     }
 
     return {
