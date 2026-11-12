@@ -23,14 +23,30 @@ DSH 单窗口内切换 Agents 对话与内置 VS Code，并在编辑器侧栏提
 
 | 用途 | Skill | 说明 |
 |---|---|---|
-| 通用联网调研（首选） | `agent-reach` | 覆盖中英文社区、技术博客、GitHub、社交/视频平台，15 个平台多后端路由 |
-| 发现还有什么可用 | `find-skills` | 不确定有没有更合适的调研 skill 时先查 |
+| 一手来源调研（首选） | `research` | mattpocock/skills，795.5K 安装、MIT、零依赖。起后台 agent 读官方文档/源码/规范，逐条标出处，产出仓库内 md |
+| 通用联网调研 | `agent-reach` | 覆盖中英文社区、技术博客、GitHub、社交/视频平台，15 个平台多后端路由 |
+| 发现还有什么可用 | `find-skills` | 不确定有没有更合适的调研 skill 时先查（`npx skills find <关键词>`） |
 
 **不存在时降级**：本机未安装 `Deep Research` / `Gemini Deep Research` / `research-analyzer` /
 `github-search` / `RAG_search` 时，**不要**在方案里假装用过它们。直接用：
 
 - `web_search`：快速事实、多个来源交叉
 - `web_fetch`：需要读某篇文章/某个仓库 README 的完整内容
+
+**选型实测记录（2026-11，避免重复调研）**：skills.sh 上安装量最高的「deep research」类
+skill **基本都要第三方付费 API Key**，本机都没有，装了也跑不了：
+
+| Skill | 安装量 | 阻断点 |
+|---|---|---|
+| `firecrawl/firecrawl-workflows@firecrawl-deep-research` | 36K | 需 Firecrawl API Key |
+| `parallel-web/parallel-agent-skills@parallel-deep-research` | 16.1K | 需 `parallel-cli` + Parallel Key |
+| `tavily-ai/skills@tavily-research` | 24K | 需 `tvly` + Tavily Key |
+| `101-skills/superpowers@web-search` | 128K | 需 `belt`/inference.sh 账号；且同内容在 5 个 owner 下镜像，安装量不可信 |
+| `199-biotechnologies/claude-deep-research-skill@deep-research` | 10.4K | 无需 Key（纯标准库），但要出正式报告时再装 |
+
+另：`langchain-ai/deepagents@web-research` 在 skills.sh 有页面且标 3.9K 安装，但**上游仓库
+并不存在该 skill**（只有 `textual-screenshot`），`npx skills use` 直接报 no matching skill。
+**不要只看安装量就下结论，装之前先用 `npx skills use` 预览真实内容。**
 
 **硬性要求**：
 
