@@ -90,14 +90,31 @@ check('activationEvents 覆盖视图与命令',
 console.log('webview 与扩展消息协议');
 const posted = [...new Set([...chatSrc.matchAll(/type:\s*'([a-zA-Z]+)'/g)].map((m) => m[1]))];
 const handled = [...new Set([...extensionSrc.matchAll(/case '([a-zA-Z]+)':/g)].map((m) => m[1]))];
-// 2026-11 协议：模型选择与上下文开关并入会话本身（Agent 自己读文件），
-// escalate 删除（Chat 本身就是 Agent），新增会话切换/重命名/列表。
-for (const type of ['ready', 'send', 'stop', 'newChat', 'selectSession', 'renameSession', 'openFile']) {
+// 2026-11 协议（tab 条 + 历史覆盖层）：
+//   - 会话切换/重命名；历史覆盖层用 listSessions(all) / searchSessions / openSession
+//   - 模型选择与上下文开关并入会话本身；escalate 删除（Chat 本身就是 Agent）
+for (const type of ['ready', 'send', 'stop', 'newChat', 'selectSession', 'renameSession', 'openFile',
+  'listSessions', 'searchSessions', 'openSession']) {
   check(`webview 发出 ${type}，扩展有处理`, posted.includes(type) && handled.includes(type));
 }
-for (const type of ['state', 'append', 'reasoning', 'prefill', 'contextInfo', 'sessions']) {
+for (const type of ['state', 'append', 'reasoning', 'prefill', 'contextInfo', 'sessions', 'allSessions']) {
   check(`扩展会推 ${type}，webview 有处理`, chatSrc.includes(`case '${type}':`));
 }
+
+console.log('交互形态（对齐 CodeBuddy）');
+check('顶部是 tab 条而非下拉框',
+  chatSrc.includes('renderTabs') && !chatSrc.includes('id="session"') && html.includes('id="tabs"'),
+  'tab 条应渲染到 #tabs，不再有 <select id=session>');
+check('tab 不显示会话 id',
+  !/sessionId\.slice|tab\.id\}\)[\s\S]{0,40}\.textContent/.test(chatSrc),
+  'tab 标签只应来自标题或「新会话 N」');
+check('历史是按钮触发的覆盖层',
+  html.includes('id="history"') && html.includes('id="history-overlay"')
+    && chatSrc.includes('showHistory'),
+  '应有历史按钮 + 覆盖层 + showHistory');
+check('覆盖层带返回按钮', html.includes('id="history-back"') && chatSrc.includes('historyBackBtn'));
+check('已从 manifest 移除常驻历史视图',
+  !JSON.stringify(manifest.contributes.views).includes('dshEditor.history'));
 
 console.log('不会泄露 token 到 webview');
 check('扩展没有把 token 放进 post 的消息',

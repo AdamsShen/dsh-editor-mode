@@ -30,7 +30,6 @@ const crypto = require('node:crypto');
 const { parseSseBlock, createSseParser } = require('./sse.js');
 const sessionView = require('./session-view.js');
 
-const HISTORY_VIEW_ID = 'dshEditor.history';
 
 const VIEW_ID = 'dshEditor.chat';
 const STATE_KEY = 'dshEditor.chat.v1';
@@ -369,6 +368,15 @@ class ChatViewProvider {
         break;
       case 'listSessions':
         await this.listSessions();
+        // 历史覆盖层要的是「全部工作区」的完整清单，不是 tab 兜底用的最近列表
+        if (message.all) await this.sendAllSessions('');
+        break;
+      case 'searchSessions':
+        await this.sendAllSessions(String(message.q || ''));
+        break;
+      case 'openSession':
+        // 点历史条目：作为新 tab 向右追加并打开
+        await this.selectSession(String(message.sessionId || ''), String(message.title || ''));
         break;
       case 'prefill':
         this.post({ type: 'prefill', text: String(message.text || '') });
@@ -394,7 +402,7 @@ class ChatViewProvider {
     this.postState();
   }
 
-  /** 拉会话列表（全部工作区），供切换器使用。 */
+  /** 拉会话列表（tab 标题兜底用，仅最近一批）。 */
   async listSessions() {
     try {
       const { status, json } = await sessionView.request(channel(), 'GET', '/editor-sessions/list');
@@ -406,23 +414,47 @@ class ChatViewProvider {
     }
   }
 
-  /** 新建一条会话（真建，不是清空数组）。 */
+  /**
+   * 拉「全部工作区」会话给历史覆盖层。
+   * 有查询词走 DSH 的跨会话 search，否则走 list（list 本身就是全量）。
+   * 与 tab 用的 sessions 消息分开，避免历史面板把上百条塞进 tab 条。
+   */
+  async sendAllSessions(query) {
+    try {
+      const path = query
+        ? `/editor-sessions/search?q=${encodeURIComponent(query)}`
+        : '/editor-sessions/list';
+      const { status, json } = await sessionView.request(channel(), 'GET', path);
+      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      this.post({ type: 'allSessions', items: Array.isArray(json?.items) ? json.items : [] });
+    } catch (err) {
+      this.post({ type: 'allSessions', items: [], error: String(err?.message || err) });
+    }
+  }
+
+  /** 新建一条会话（真建，不是清空数组）；新 id 会让前端 tab 条向右追加。 */
   async newChat() {
     this.detach();
+    // 不先推一个「无会话」的空态：那会让 tab 条闪一下。
+    // 直接建会话，ensureSession 拿到 id 后一次 state 推送即可追加新 tab。
     this.sessionId = '';
     this.sessionTitle = '';
     this.messages = [];
     this.error = '';
-    this.postState();
     try { await this.ensureSession(); } catch (err) { this.fail(err); }
     await this.listSessions();
   }
 
-  /** 切到指定会话：先读历史，再挂上实时流。 */
-  async selectSession(sessionId) {
+  /**
+   * 切到指定会话：先读历史，再挂上实时流。
+   * @param {string} sessionId 会话 id
+   * @param {string} [knownTitle] 从历史列表带来的标题，让新 tab 立刻有名字
+   */
+  async selectSession(sessionId, knownTitle = '') {
     if (!sessionId || sessionId === this.sessionId) return;
     this.detach();
     this.sessionId = sessionId;
+    this.sessionTitle = knownTitle || '';
     this.messages = [];
     this.error = '';
     this.postState();
@@ -654,117 +686,6 @@ class ChatViewProvider {
 }
 
 // ---------------------------------------------------------------------------
-// 历史面板：全部工作区的会话
-// ---------------------------------------------------------------------------
-
-class HistoryViewProvider {
-  /**
-   * @param {vscode.ExtensionContext} context 扩展上下文
-   * @param {{openSession:(id:string)=>Promise<void>}} hooks 打开会话的回调
-   */
-  constructor(context, hooks) {
-    this.context = context;
-    this.hooks = hooks;
-    this.view = null;
-    this.mediaRoot = vscode.Uri.joinPath(context.extensionUri, 'media');
-    this.mediaDir = path.join(context.extensionUri.fsPath, 'media');
-    this.items = [];
-    this.query = '';
-    this.error = '';
-  }
-
-  post(message) {
-    try { this.view?.webview.postMessage(message); } catch { /* 视图已销毁 */ }
-  }
-
-  postState() {
-    this.post({
-      type: 'state',
-      items: this.items,
-      query: this.query,
-      error: this.error,
-      grouped: groupByDay(this.items),
-    });
-  }
-
-  resolveWebviewView(webviewView) {
-    this.view = webviewView;
-    const webview = webviewView.webview;
-    webview.options = { enableScripts: true, localResourceRoots: [this.mediaRoot] };
-    const nonce = crypto.randomBytes(16).toString('base64');
-    const uri = (name) => webview.asWebviewUri(vscode.Uri.joinPath(this.mediaRoot, name)).toString();
-    let html = '';
-    try {
-      html = fs.readFileSync(path.join(this.mediaDir, 'history.html'), 'utf8');
-    } catch {
-      html = '<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:16px">'
-        + 'history.html 缺失，请重装 DSH 编辑器模式扩展。</body>';
-    }
-    html = html
-      .replace(/\{\{cspSource\}\}/g, webview.cspSource)
-      .replace(/\{\{nonce\}\}/g, nonce)
-      .replace(/\{\{scriptUri\}\}/g, uri('history.js'))
-      .replace(/\{\{styleUri\}\}/g, uri('history.css'));
-    webview.html = html;
-
-    webview.onDidReceiveMessage((message) => { void this.onMessage(message); });
-    webviewView.onDidChangeVisibility(() => { if (webviewView.visible) void this.refresh(); });
-    webviewView.onDidDispose(() => { if (this.view === webviewView) this.view = null; });
-    this.postState();
-    void this.refresh();
-  }
-
-  async onMessage(message) {
-    switch (message?.type) {
-      case 'ready': this.postState(); void this.refresh(); break;
-      case 'refresh': await this.refresh(); break;
-      case 'search': this.query = String(message.q || ''); await this.refresh(); break;
-      case 'open': await this.hooks.openSession(String(message.sessionId || '')); break;
-      default: break;
-    }
-  }
-
-  /** 有查询词走 search，否则走 list；两条都覆盖全部工作区。 */
-  async refresh() {
-    this.error = '';
-    try {
-      const path = this.query
-        ? `/editor-sessions/search?q=${encodeURIComponent(this.query)}`
-        : '/editor-sessions/list';
-      const { status, json } = await sessionView.request(channel(), 'GET', path);
-      if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
-      this.items = Array.isArray(json?.items) ? json.items : [];
-      this.postState();
-    } catch (err) {
-      this.error = String(err?.message || err);
-      this.items = [];
-      this.postState();
-    }
-  }
-}
-
-/** 按「今天 / 昨天 / 近 7 天 / 更早」分组，前端直接渲染。 */
-function groupByDay(items) {
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const day = 24 * 3600 * 1000;
-  const buckets = [
-    { key: 'today', label: '今天', items: [] },
-    { key: 'yesterday', label: '昨天', items: [] },
-    { key: 'week', label: '近 7 天', items: [] },
-    { key: 'older', label: '更早', items: [] },
-  ];
-  for (const item of Array.isArray(items) ? items : []) {
-    const t = Number(item?.updatedAt) || 0;
-    if (t >= startOfToday) buckets[0].items.push(item);
-    else if (t >= startOfToday - day) buckets[1].items.push(item);
-    else if (t >= startOfToday - 7 * day) buckets[2].items.push(item);
-    else buckets[3].items.push(item);
-  }
-  return buckets.filter((b) => b.items.length);
-}
-
-// ---------------------------------------------------------------------------
 // 选区 → Agents（原有能力）
 // ---------------------------------------------------------------------------
 
@@ -816,15 +737,6 @@ function formatPayload(file, line, text) {
 function activate(context) {
   // 命令与 webview 都要用，先建单例（视图是按需 resolve 的）。
   const provider = new ChatViewProvider(context, { pushToAgents });
-  const history = new HistoryViewProvider(context, {
-    // 点历史项：切到该会话并聚焦聊天视图
-    openSession: async (sessionId) => {
-      await provider.selectSession(sessionId);
-      const id = provider.visibleViewId() || VIEW_ID;
-      await vscode.commands.executeCommand(`${id}.focus`);
-    },
-  });
-
   const send = (includeSelection) => {
     const data = collect(includeSelection);
     if (!data) {
@@ -859,9 +771,6 @@ function activate(context) {
     vscode.commands.registerCommand('dshEditorBridge.sendSelection', () => send(true)),
     vscode.commands.registerCommand('dshEditorBridge.sendFile', () => send(false)),
     vscode.commands.registerCommand('dshEditorBridge.askSelection', () => { void askSelection(); }),
-    vscode.window.registerWebviewViewProvider(HISTORY_VIEW_ID, history, {
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
     vscode.commands.registerCommand('dshEditorBridge.newChat', () => {
       void provider.newChat();
       void vscode.commands.executeCommand('dshEditor.chat.focus');
@@ -904,6 +813,5 @@ module.exports = {
   formatPayload,
   parseSseBlock,
   channel,
-  groupByDay,
   foldEvents: sessionView.foldEvents,
 };

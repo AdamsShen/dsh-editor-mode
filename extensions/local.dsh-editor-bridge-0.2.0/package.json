@@ -39,11 +39,6 @@
           "id": "dshEditor.chat",
           "name": "Chat",
           "type": "webview"
-        },
-        {
-          "id": "dshEditor.history",
-          "name": "历史会话",
-          "type": "webview"
         }
       ],
       "dshEditorSecondary": [
@@ -52,11 +47,6 @@
           "name": "Chat",
           "type": "webview",
           "initialSize": 1
-        },
-        {
-          "id": "dshEditor.history",
-          "name": "历史会话",
-          "type": "webview"
         }
       ]
     },

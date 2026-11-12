@@ -9,13 +9,19 @@
  *
  * 消息协议：
  *   发往扩展：ready / send / stop / newChat / selectSession / renameSession
- *             / listSessions / openFile
- *   来自扩展：state（全量）/ append / reasoning / sessions / prefill / contextInfo
+ *             / listSessions / searchSessions / openFile
+ *   来自扩展：state（全量）/ append / reasoning / sessions / allSessions
+ *             / prefill / contextInfo
  *
  * 消息模型（由扩展侧折叠，前端只渲染）：
  *   { role:'user'|'assistant',
  *     reasoning: string,
  *     parts: [ {type:'text', text} | {type:'tool', callId, name, summary, result, status} ] }
+ *
+ * 交互形态对齐 CodeBuddy：
+ *   - 顶部是「向右追加的会话 tab 条」，只显示标题，不显示会话 id；
+ *     用户本次打开的会话才进 tab 条，历史里的条目不自动铺开。
+ *   - 右上角时钟按钮打开「历史对话」覆盖层（全部工作区、可搜索、带返回）。
  */
 
 (function () {
@@ -27,9 +33,16 @@
   const sendBtn = $('send');
   const stopBtn = $('stop');
   const errEl = $('error');
-  const sessionEl = $('session');
-  const renameBtn = $('rename');
+  const tabsEl = $('tabs');
   const newBtn = $('new');
+  const historyBtn = $('history');
+  const overlayEl = $('history-overlay');
+  const historyBackBtn = $('history-back');
+  const historyRefreshBtn = $('history-refresh');
+  const historyQEl = $('history-q');
+  const historyListEl = $('history-list');
+  const historyEmptyEl = $('history-empty');
+  const historyErrEl = $('history-error');
   const ctxInfoEl = $('ctxinfo');
   const hintEl = $('hint');
   const emptyEl = $('empty');
@@ -42,7 +55,17 @@
     error: '',
     contextLabel: '',
     hasEditor: false,
+    /** 最近会话（用于给未命名 tab 兜底标题），不放进 tab 条。 */
     sessions: [],
+    /**
+     * 本次会话期间打开过的 tab，按打开顺序向右追加。
+     * 每项 {id, title}；title 为空时用「新会话 N」占位，绝不显示 id。
+     */
+    tabs: [],
+    /** 历史覆盖层里的全部工作区会话。 */
+    allSessions: [],
+    historyQuery: '',
+    historyError: '',
   };
 
   const dirty = new Set();
@@ -229,32 +252,159 @@
     });
   }
 
-  /** 会话切换器：当前会话 + 最近会话列表。 */
-  function renderSessions() {
-    sessionEl.textContent = '';
-    const current = document.createElement('option');
-    current.value = state.sessionId || '';
-    current.textContent = state.sessionTitle
-      || (state.sessionId ? state.sessionId.slice(0, 12) : '新会话');
-    sessionEl.appendChild(current);
-
-    const others = state.sessions.filter((s) => s.id !== state.sessionId);
-    if (others.length) {
-      const group = document.createElement('optgroup');
-      group.label = '最近会话';
-      for (const item of others) {
-        const opt = document.createElement('option');
-        opt.value = item.id;
-        opt.textContent = item.title || shortDir(item.cwd) || item.id.slice(0, 12);
-        group.appendChild(opt);
-      }
-      sessionEl.appendChild(group);
-    }
-  }
-
+  /** 目录取最后两段，仅用于历史列表的副标题。 */
   function shortDir(cwd) {
     if (!cwd) return '';
     return String(cwd).split(/[\\/]/).filter(Boolean).slice(-2).join('/');
+  }
+
+  /**
+   * 保证当前会话在 tab 条里；点历史里的旧会话或「新建」时向右追加一个 tab。
+   * tab 只放本次打开的会话，不把全部历史都铺开（否则上百条会挤爆侧栏）。
+   */
+  function ensureTab(id, title) {
+    if (!id) return;
+    const index = state.tabs.findIndex((t) => t.id === id);
+    if (index >= 0) {
+      if (title && title !== state.tabs[index].title) {
+        state.tabs[index].title = title;
+      }
+      return;
+    }
+    state.tabs.push({ id, title: title || '' });
+  }
+
+  /** tab 显示名：优先真实标题，其次「新会话 N」，**任何情况都不显示 id**。 */
+  function tabLabel(tab, index) {
+    return tab.title && tab.title.trim() ? tab.title.trim() : `新会话 ${index + 1}`;
+  }
+
+  /** 渲染向右追加的 tab 条。 */
+  function renderTabs() {
+    tabsEl.textContent = '';
+    state.tabs.forEach((tab, index) => {
+      const item = document.createElement('div');
+      item.className = 'tab';
+      item.dataset.active = String(tab.id === state.sessionId);
+      item.title = tabLabel(tab, index);
+
+      const label = document.createElement('span');
+      label.className = 'tab-label';
+      label.textContent = tabLabel(tab, index);
+      item.appendChild(label);
+
+      // 双击 tab 重命名（不额外占按钮位置，与常见 IDE 习惯一致）
+      item.addEventListener('dblclick', () => {
+        const name = window.prompt('会话标题', tab.title || '');
+        if (name && name.trim()) {
+          vscode.postMessage({ type: 'renameSession', title: name.trim() });
+        }
+      });
+
+      item.addEventListener('click', () => {
+        if (tab.id !== state.sessionId) {
+          vscode.postMessage({ type: 'selectSession', sessionId: tab.id });
+        }
+      });
+      tabsEl.appendChild(item);
+    });
+    // 让当前 tab 保持可见（tab 多时横向滚动）
+    const active = tabsEl.querySelector('.tab[data-active="true"]');
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+
+  // ---------------------------------------------------------------- 历史覆盖层
+
+  function showHistory(open) {
+    overlayEl.hidden = !open;
+    if (open) {
+      historyQEl.value = state.historyQuery;
+      historyQEl.focus();
+      // 打开时拉全量；搜索时由 searchSessions 覆盖
+      vscode.postMessage({ type: 'listSessions', all: true });
+    }
+  }
+
+  /** 时间戳 → HH:MM（今天）或 M/D。 */
+  function timeLabel(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    return sameDay
+      ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+      : `${d.getMonth() + 1}/${d.getDate()}`;
+  }
+
+  /** 按「今天 / 昨天 / 近 7 天 / 更早」分组（前端自己算，扩展只给排序好的列表）。 */
+  function groupByDay(items) {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const day = 24 * 3600 * 1000;
+    const buckets = [
+      { label: '今天', items: [] },
+      { label: '昨天', items: [] },
+      { label: '近 7 天', items: [] },
+      { label: '更早', items: [] },
+    ];
+    for (const item of Array.isArray(items) ? items : []) {
+      const t = Number(item?.updatedAt) || 0;
+      if (t >= startOfToday) buckets[0].items.push(item);
+      else if (t >= startOfToday - day) buckets[1].items.push(item);
+      else if (t >= startOfToday - 7 * day) buckets[2].items.push(item);
+      else buckets[3].items.push(item);
+    }
+    return buckets.filter((b) => b.items.length);
+  }
+
+  function renderAllSessions() {
+    const items = state.allSessions || [];
+    historyErrEl.hidden = !state.historyError;
+    if (state.historyError) historyErrEl.textContent = state.historyError;
+    historyEmptyEl.hidden = items.length > 0 || Boolean(state.historyError);
+    historyEmptyEl.textContent = state.historyQuery
+      ? `没有匹配「${state.historyQuery}」的对话`
+      : '还没有历史对话';
+
+    historyListEl.textContent = '';
+    for (const group of groupByDay(items)) {
+      const title = document.createElement('div');
+      title.className = 'group-title';
+      title.textContent = group.label;
+      historyListEl.appendChild(title);
+      for (const item of group.items) {
+        const row = document.createElement('div');
+        row.className = 'history-row';
+        row.title = item.cwd || '';
+
+        const name = document.createElement('div');
+        name.className = 'history-row-title';
+        // 不显示 id：用标题，没标题用目录名
+        name.textContent = item.title || shortDir(item.cwd) || '未命名对话';
+        row.appendChild(name);
+
+        const meta = document.createElement('div');
+        meta.className = 'history-row-meta';
+        const bits = [timeLabel(item.updatedAt)];
+        if (item.cwd) bits.push(shortDir(item.cwd));
+        meta.textContent = bits.filter(Boolean).join(' · ');
+        row.appendChild(meta);
+
+        if (item.snippet) {
+          const snip = document.createElement('div');
+          snip.className = 'history-row-snippet';
+          snip.textContent = String(item.snippet).replace(/\s+/g, ' ').slice(0, 100);
+          row.appendChild(snip);
+        }
+
+        row.addEventListener('click', () => {
+          // 点历史项：作为新 tab 向右追加并打开，然后收起覆盖层
+          vscode.postMessage({ type: 'openSession', sessionId: item.id, title: item.title || '' });
+          showHistory(false);
+        });
+        historyListEl.appendChild(row);
+      }
+    }
   }
 
   function renderStatus() {
@@ -285,13 +435,23 @@
   sendBtn.addEventListener('click', onSubmit);
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
   newBtn.addEventListener('click', () => vscode.postMessage({ type: 'newChat' }));
-  renameBtn.addEventListener('click', () => {
-    const title = window.prompt('会话标题', state.sessionTitle || '');
-    if (title && title.trim()) vscode.postMessage({ type: 'renameSession', title: title.trim() });
+  historyBtn.addEventListener('click', () => showHistory(true));
+  historyBackBtn.addEventListener('click', () => showHistory(false));
+  historyRefreshBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'listSessions', all: true });
   });
-  sessionEl.addEventListener('change', () => {
-    const id = sessionEl.value;
-    if (id && id !== state.sessionId) vscode.postMessage({ type: 'selectSession', sessionId: id });
+
+  let searchTimer = null;
+  historyQEl.addEventListener('input', () => {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.historyQuery = historyQEl.value.trim();
+      if (state.historyQuery) {
+        vscode.postMessage({ type: 'searchSessions', q: state.historyQuery });
+      } else {
+        vscode.postMessage({ type: 'listSessions', all: true });
+      }
+    }, 250);
   });
 
   inputEl.addEventListener('input', autoGrow);
@@ -332,7 +492,9 @@
         state.error = msg.error || '';
         state.contextLabel = msg.contextLabel || '';
         state.hasEditor = Boolean(msg.hasEditor);
-        renderSessions();
+        // 当前会话进入（或更新）tab 条；新建会话时 id 变化会自动向右追加
+        if (state.sessionId) ensureTab(state.sessionId, state.sessionTitle);
+        renderTabs();
         renderStatus();
         fullRender();
         break;
@@ -358,8 +520,19 @@
         break;
       }
       case 'sessions':
+        // 会话列表变更（标题生成后回推）：同步刷新 tab 上的标题
         state.sessions = Array.isArray(msg.items) ? msg.items : [];
-        renderSessions();
+        for (const tab of state.tabs) {
+          const found = state.sessions.find((s) => s.id === tab.id);
+          if (found?.title) tab.title = found.title;
+        }
+        renderTabs();
+        break;
+      case 'allSessions':
+        // 历史覆盖层的数据（全部工作区 / 搜索结果）
+        state.allSessions = Array.isArray(msg.items) ? msg.items : [];
+        state.historyError = msg.error || '';
+        renderAllSessions();
         break;
       case 'contextInfo':
         state.contextLabel = msg.label || '';
@@ -377,7 +550,7 @@
   });
 
   renderStatus();
-  renderSessions();
+  renderTabs();
   fullRender();
   vscode.postMessage({ type: 'ready' });
 }());

@@ -10,10 +10,10 @@
 </head>
 <body>
   <div class="app">
-    <header class="bar">
-      <select id="session" class="session" title="当前会话（与 DSH Agents 同一个）"></select>
-      <button id="rename" class="icon-btn" title="重命名当前会话">✎</button>
+    <header class="bar tabs-bar">
+      <div id="tabs" class="tabs"></div>
       <button id="new" class="icon-btn" title="新建会话">＋</button>
+      <button id="history" class="icon-btn" title="历史对话">&#128337;</button>
     </header>
 
     <div id="error" class="error" hidden></div>
@@ -23,7 +23,7 @@
         <p class="empty-title">DSH Chat</p>
         <p class="empty-hint">这是 DSH 真实 Agent 会话，<b>能改文件、能跑命令</b>。<br />
           在编辑器里问过的问题，切到 DSH Agents 模式能看到同一条会话。</p>
-        <p class="empty-hint dim">历史面板里可以按工作区翻旧会话。</p>
+        <p class="empty-hint dim">点右上角时钟图标查看全部历史对话。</p>
       </div>
     </main>
 
@@ -39,6 +39,22 @@
       </div>
     </footer>
   </div>
+
+  <!-- 历史对话覆盖层：点右上角时钟打开，盖住整个侧栏；带返回按钮。 -->
+  <div id="history-overlay" class="history-overlay" hidden>
+    <header class="bar">
+      <button id="history-back" class="icon-btn" title="返回">&#8249;</button>
+      <strong class="history-title">历史对话</strong>
+      <button id="history-refresh" class="icon-btn" title="刷新">&#8635;</button>
+    </header>
+    <div class="history-search">
+      <input id="history-q" type="search" placeholder="搜索全部工作区的对话…" autocomplete="off" />
+    </div>
+    <div id="history-error" class="error" hidden></div>
+    <div id="history-list" class="history-list"></div>
+    <div id="history-empty" class="empty" hidden>还没有历史对话</div>
+  </div>
+
   <script nonce="{{nonce}}" src="{{markdownUri}}"></script>
   <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
 </body>
