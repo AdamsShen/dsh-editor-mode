@@ -510,16 +510,82 @@ function sseWriter(res) {
   return { write, get closed() { return closed; } };
 }
 
-export function apply(ctx, config = {}) {
-  const webServer = ctx.get('webServer');
-  if (!webServer) throw new Error('editor-mode 需要 webServer 服务（当前 profile 未挂载）');
+/**
+ * 本插件依赖的服务。
+ *
+ * 关键：不能只在 apply() 里 ctx.get('webServer') 然后 throw。
+ * cordis 按拓扑顺序解析服务，插件行可能早于 `webserver` 行求值；一旦 apply
+ * 同步抛错，这一行会**永久不激活**且不会重试，表现为 DSH 正常但所有
+ * /editor* 路由 404（桌面端还会把这条错误吞进 stderr，用户完全看不到）。
+ *
+ * 声明式依赖让 cordis 等到服务就绪后再执行 apply，顺序由它保证。
+ */
+export const inject = ['webServer'];
 
+/**
+ * 兜底：即便运行时不按 inject 等待（例如老版本 loader 忽略该字段），
+ * 也改成「延迟重试」而不是抛错，避免静默失效。
+ */
+function whenWebServer(ctx, run, attempts = 40, delayMs = 250) {
+  const ready = ctx.get('webServer');
+  if (ready) { run(ready); return () => {}; }
+
+  let off = () => {};
+  try {
+    // cordis 的服务就绪事件；不同版本名称不同，都试一遍。
+    off = ctx.on('internal/service', (name) => {
+      if (name !== 'webServer') return;
+      const svc = ctx.get('webServer');
+      if (!svc) return;
+      off();
+      off = () => {};
+      run(svc);
+    }) || (() => {});
+  } catch { off = () => {}; }
+
+  // 轮询兜底：覆盖不派发事件的情形；有次数上限，不会无限占用定时器。
+  let left = attempts;
+  const timer = setInterval(() => {
+    left -= 1;
+    const svc = ctx.get('webServer');
+    if (svc) {
+      clearInterval(timer);
+      off();
+      off = () => {};
+      run(svc);
+      return;
+    }
+    if (left <= 0) {
+      clearInterval(timer);
+      ctx.logger?.warn?.('[editor-mode] webServer 未就绪，编辑器后端未启动（请在 DSH 设置中确认 webserver 插件已启用）');
+    }
+  }, delayMs);
+  timer.unref?.();
+
+  return () => { clearInterval(timer); off(); };
+}
+
+export function apply(ctx, config = {}) {
   // 轻量校验：config 无 schema，靠这里兜住明显错配，避免端口/路径非法时静默失败。
   const port = Number(config.upstreamPort ?? 3999);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`editor-mode: upstreamPort 必须是 1..65535，收到 ${String(config.upstreamPort)}`);
   }
   void port;
+
+  // 服务就绪后再装配；拿不到时延迟重试而不是抛错（见 whenWebServer 注释）。
+  const stopWaiting = whenWebServer(ctx, (webServer) => installEditor(ctx, config, webServer));
+  ctx.effect(() => () => stopWaiting());
+}
+
+/**
+ * 真正的装配：只在 webServer 已就绪时调用。
+ * 与 apply 分开是因为 apply 可能在服务就绪前被调用（时序问题见 whenWebServer）。
+ * @param ctx 插件上下文
+ * @param config 插件 config（cordis.patch.yml 的 editor-mode.config）
+ * @param webServer @deepseek-ai/dsh-host-webserver 服务实例
+ */
+function installEditor(ctx, config, webServer) {
 
   const state0 = { status: 'starting', upstream: '', workspace: '', log: '' };
   let runtime = null;

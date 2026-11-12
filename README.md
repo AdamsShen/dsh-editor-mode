@@ -168,6 +168,10 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
   `registerUpgrade` 只支持 exact path；跨 origin 由 `--trusted-origins '*'` + `--auth none`
   放行，仅监听 `127.0.0.1`。
 - 无 Config schema、无运行时自动下载/校验、无崩溃自动重启。
+- **`webServer` 是声明式依赖**（`export const inject = ['webServer']`），另有轮询兜底：
+  cordis 可能在本插件之后才就绪 `webserver`，旧实现直接 throw 会让这一行永久不激活，
+  现象是全站 `/editor*` 404、code-server 不起，而桌面端把该错误吞进 stderr。
+  `test/host-late-service.test.mjs` 守住了这条。
 - 全局快捷键、下载、扩展 webview 在 iframe 内可能有损耗。
 - code-server 发行包内置的 GitHub Copilot Chat **不再加载**（`VSCODE_SKIP_BUILTIN_EXTENSIONS`，
   由 `skipBuiltinExtensions` 配置控制）。它占的右侧 Chat 面板由 DSH Chat 侧栏替代；
