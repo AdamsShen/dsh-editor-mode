@@ -5,3 +5,7 @@ node_modules/
 extensions/extensions.json
 # 同上：code-server 的废弃标记，也是运行时生成，不入库
 extensions/.obsolete
+# autopilot 运行时状态（state.db / WAL / 会话转录），由插件自管，不入库
+.autopilot/
+# 会话转录导出，按需生成，不入库
+session-*-content.md
