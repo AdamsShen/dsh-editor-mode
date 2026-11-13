@@ -18,7 +18,8 @@
     "onCommand:dshEditorBridge.sendExplorerFiles",
     "onCommand:dshEditorBridge.sendExplorerFolder",
     "onCommand:dshEditorBridge.sendTerminalSelection",
-    "onCommand:dshEditorBridge.importRules"
+    "onCommand:dshEditorBridge.importRules",
+    "onCommand:dshEditorBridge.nextEdit"
   ],
   "contributes": {
     "viewsContainers": {
@@ -100,6 +101,11 @@
         "command": "dshEditorBridge.importRules",
         "title": "把旧规则文件导入 AGENTS.md",
         "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.nextEdit",
+        "title": "预测下一处编辑",
+        "category": "DSH"
       }
     ],
     "menus": {
@@ -156,9 +162,20 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "启用行内代码补全（Tab 接受、Esc 取消）。默认关闭：补全会持续调用模型，按需开启。"
+        },
+        "dshEditorBridge.nextEdit.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "启用「下一处编辑预测」。默认关闭：每次触发都会调用模型。快捷键 Shift+Alt+N。"
         }
       }
     },
-    "keybindings": []
+    "keybindings": [
+      {
+        "command": "dshEditorBridge.nextEdit",
+        "key": "shift+alt+n",
+        "when": "editorTextFocus"
+      }
+    ]
   }
 }

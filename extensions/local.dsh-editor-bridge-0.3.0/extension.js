@@ -1361,6 +1361,86 @@ function parseMcpTool(name) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// 下一处编辑预测（P4-3 NES）
+// ---------------------------------------------------------------------------
+
+/**
+ * 请求并展示「下一处可编辑位置」。
+ *
+ * 交互刻意做轻：不弹窗打断、不强制跳转，只在状态栏提示并提供跳转。
+ * 因为 NES 是**猜测**，猜错时强行打断比不提更烦人。
+ *
+ * @param {object} ctx 扩展上下文（用于 status bar 与命令）
+ */
+async function suggestNextEdit() {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.uri.scheme !== 'file') {
+    vscode.window.showInformationMessage('没有可分析的文件');
+    return;
+  }
+  const doc = editor.document;
+  // 文档过大时不发：NES 看的是局部，整文件传输既慢又浪费
+  if (doc.lineCount > 5000) {
+    vscode.window.showInformationMessage('文件过大，暂不分析下一处编辑');
+    return;
+  }
+
+  const enabled = vscode.workspace.getConfiguration('dshEditorBridge')
+    .get('nextEdit.enabled', false);
+  if (!enabled) {
+    vscode.window.showInformationMessage(
+      '下一处编辑预测未启用（设置 dshEditorBridge.nextEdit.enabled）',
+    );
+    return;
+  }
+
+  const pos = editor.selection.active;
+  const text = doc.getText();
+  const offset = doc.offsetAt(pos);
+
+  let json;
+  try {
+    const res = await sessionView.request(channel(), 'POST', '/editor-next-edit', {
+      file: toWorkspacePath(doc.uri.fsPath || ''),
+      language: doc.languageId || '',
+      document: text,
+      prefix: text.slice(Math.max(0, offset - 1500), offset),
+      suffix: text.slice(offset, offset + 500),
+    }, 8000);
+    if (res.status !== 200) {
+      // 注意用 res.json：此时 json 还没被赋值，引用它只会拿到 undefined
+      vscode.window.showWarningMessage(res.json?.error || `预测失败（HTTP ${res.status}）`);
+      return;
+    }
+    json = res.json;
+  } catch (err) {
+    vscode.window.showWarningMessage(`预测失败：${String(err?.message || err)}`);
+    return;
+  }
+
+  const next = json?.next;
+  if (!next || !Number.isInteger(next.line)) {
+    vscode.window.setStatusBarMessage('没有找到下一处需要修改的位置', 3000);
+    return;
+  }
+
+  // 只提示，不跳转：用户自己决定要不要去
+  vscode.window.setStatusBarMessage(
+    `下一处可能在这里：第 ${next.line} 行（点击跳转；Shift+Alt+N 重新预测）`,
+    8000,
+  );
+  const action = await vscode.window.showInformationMessage(
+    `下一处可能在这里：第 ${next.line} 行`,
+    '跳转过去',
+  );
+  if (action === '跳转过去') {
+    const target = new vscode.Position(Math.max(0, next.line - 1), 0);
+    editor.selection = new vscode.Selection(target, target);
+    editor.revealRange(new vscode.Range(target, target), vscode.TextEditorRevealType.InCenter);
+  }
+}
+
 /** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 *//** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 *//** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 *//** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 */
 function formatPayload(file, line, text) {
   const loc = file ? `@${file}${line ? `:${line}` : ''}` : '';
@@ -1549,6 +1629,7 @@ function activate(context) {
       void sendTerminalSelection();
     }),
     vscode.commands.registerCommand('dshEditorBridge.importRules', () => importRules()),
+    vscode.commands.registerCommand('dshEditorBridge.nextEdit', () => { void suggestNextEdit(); }),
     // 行内补全：只在支持的语言里注册（provider 内部还会再过滤一次）
     vscode.languages.registerInlineCompletionItemProvider(
       [{ scheme: 'file' }],

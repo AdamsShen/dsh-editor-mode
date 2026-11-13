@@ -1169,6 +1169,127 @@ function rgPath() {
 }
 
 // ---------------------------------------------------------------------------
+// 下一处编辑预测（P4-3 NES）
+// ---------------------------------------------------------------------------
+
+/**
+ * NES 与补全共用同一条低延迟链路（同一个 llm 服务、同样的预算与超时），
+ * 但问的问题不同：补全问「这里该写什么」，NES 问「改完这段后，接下来
+ * 最该动哪里」。
+ *
+ * 输出做成结构化是刻意的：模型自由输出时经常给出无法执行的建议
+ * （"考虑重构" 之类），用户点了没反应比没有这个功能更糟。
+ * 所以要求它只回 `<文件>:<行>` 或者 `NONE`。
+ */
+const NES_LIMITS = {
+  maxContextChars: 3000,     // 只看光标附近，不需要整文件
+  maxTokens: 60,
+  timeoutMs: 2500,           // 比补全宽一点：用户是主动触发，可以多等
+};
+
+/**
+ * 预测下一处可编辑位置。
+ *
+ * @param {object} deps { llm, provider, model }
+ * @param {{file:string, language:string, prefix:string, suffix:string, document:string}} req
+ * @returns {Promise<{file:string, line:number} | null>} 无可预测位置返回 null
+ */
+export async function requestNextEdit(deps, req) {
+  const { llm, provider, model } = deps;
+  if (!llm?.prepareCall) return null;
+  const doc = String(req?.document || '');
+  if (!doc.trim()) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NES_LIMITS.timeoutMs);
+
+  try {
+    const prepared = await Promise.race([
+      llm.prepareCall(provider, model, controller.signal),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('prepare 超时')), NES_LIMITS.timeoutMs);
+      }),
+    ]);
+
+    // 带行号的正文，方便模型直接引用行号
+    const numbered = doc
+      .split('\n')
+      .slice(0, 400)
+      .map((line, i) => `${i + 1}: ${line}`)
+      .join('\n')
+      .slice(-NES_LIMITS.maxContextChars);
+
+    const messages = [{
+      role: 'user',
+      content: [
+        `文件：${req?.file || '未命名'}；语言：${req?.language || '未知'}`,
+        '下面是带行号的代码。用户在光标位置刚完成一处编辑。',
+        '请判断接下来最可能需要继续修改的位置。',
+        '只输出一行，格式必须是 `<行号>` 或 `NONE`（没有明确需要修改的地方就输出 NONE）。',
+        '不要解释、不要输出代码、不要输出文件名。',
+        '<code>',
+        numbered,
+        '</code>',
+      ].join('\n'),
+    }];
+
+    let text = '';
+    // 与补全一致：流式阶段也要有硬超时，否则 stream 挂起时整个请求永不结束
+    const collect = (async () => {
+      const stream = prepared.stream({ messages, maxTokens: NES_LIMITS.maxTokens, signal: controller.signal });
+      for await (const chunk of stream) {
+        const delta = chunk?.delta?.text ?? chunk?.text ?? '';
+        if (delta) text += delta;
+        if (text.length > 200) break;
+      }
+      return text;
+    })();
+    await Promise.race([
+      collect,
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('stream 超时')), NES_LIMITS.timeoutMs);
+      }),
+    ]);
+    return parseNextEdit(text, req?.file, doc.split('\n').length);
+  } catch {
+    return null;   // 与补全一致：失败静默
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 解析 NES 输出。
+ *
+ * 模型常不守格式（加反引号、带文件名、多输出几行），所以这里做容错：
+ * 能抽出一个有效行号就用，抽不出来就当作没有建议。
+ * 行号必须落在文档范围内 —— 越界会让 IDE 跳到文件末尾之外。
+ *
+ * @param {string} raw 模型输出
+ * @param {string} file 目标文件
+ * @param {number} totalLines 文档总行数
+ * @returns {{file:string, line:number} | null}
+ */
+export function parseNextEdit(raw, file, totalLines) {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  if (/\bNONE\b/i.test(text)) return null;
+
+  // 取第一个独立出现的整数（容忍 `行 42`、`` `42` ``、`src/a.js:42`）
+  const m = /(?:^|[^\d-])(\d{1,6})(?![\d])/.exec(text);
+  if (!m) return null;
+  // 前面的字符若紧跟负号，说明模型给的可能是 -5 之类，别把它读成 5
+  const before = text.slice(0, m.index + m[0].indexOf(m[1]));
+  if (/-\s*$/.test(before)) {
+    const all = /-\d+/.exec(text);
+    if (all) return null;
+  }
+  const line = Number(m[1]);
+  if (!Number.isInteger(line) || line < 1) return null;
+  if (Number.isInteger(totalLines) && totalLines > 0 && line > totalLines) return null;
+  return { file: String(file || ''), line };
+}
+
 export function apply(ctx, rawConfig = {}) {
   // 启动即校验：非法配置在这里一次性报全，不要留到 spawn 阶段变成白屏。
   const { value: config, errors, warnings } = validateConfig(rawConfig);
@@ -1329,6 +1450,60 @@ async function installEditor(ctx, config, webServer) {
   // 必须在两个 handler 之前声明 —— 虽然闭包实际执行时已初始化，
   // 但把"能用"寄托在求值顺序上太脆弱，读代码的人也无从判断。
   let completionInflight = 0;
+
+  // ---- 下一处编辑预测端点（NES）----
+  // NES 与补全共用同一个并发池：两者都会真实调模型，分开限流会让总并发翻倍。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/editor-next-edit',
+    handler: async (req, res) => {
+      if (!bridgeAllowed(req)) { res.writeHead(403); res.end(); return; }
+      if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+      const read = await readJsonBody(req, 512 * 1024);
+      if (read.tooLarge) { res.writeHead(413); res.end(); return; }
+      const body = read.value || {};
+      const llm = ctx.get('llm');
+      if (!llm?.prepareCall) {
+        res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'DSH 未提供 llm 服务，下一处编辑预测不可用' }));
+        return;
+      }
+      let provider = body.provider || '';
+      let model = body.model || '';
+      try {
+        if (!provider || !model) {
+          const def = ctx.get('defaultModel')?.get?.();
+          provider = provider || def?.provider || '';
+          model = model || def?.model || '';
+        }
+      } catch { /* 忽略 */ }
+      if (!provider || !model) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ next: null, reason: 'no-model' }));
+        return;
+      }
+      if (completionInflight >= COMPLETION_SERVER_MAX) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ next: null, reason: 'busy' }));
+        return;
+      }
+      const controller = new AbortController();
+      req.on('close', () => controller.abort());
+      completionInflight += 1;
+      let next = null;
+      try {
+        next = await requestNextEdit({ llm, provider, model }, body);
+      } finally {
+        completionInflight -= 1;
+      }
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('cache-control', 'no-store');
+      res.end(JSON.stringify({ next }));
+    },
+  }), 'editor-mode: POST /editor-next-edit');
 
   // ---- 本地代码检索端点 ----
   // 只在本机工作区内跑 rg，结果不落盘、不上传：代码不外发是硬要求。
