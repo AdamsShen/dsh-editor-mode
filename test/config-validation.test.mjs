@@ -178,7 +178,7 @@ console.log('apply()：非法配置抛错且可被 /editor-status 读到');
   }
   check('抛出了错误', thrown.length > 0);
   check('错误里列出全部问题', thrown.includes('upstreamPort') && thrown.includes('配置有'), thrown);
-  check('记录到 lastConfigError 供状态路由读取',
+  check('记录到 lastConfigError（面包屑，供日志与测试；此时路由尚未注册）',
     String(mod.apply.lastConfigError || '').includes('upstreamPort'), mod.apply.lastConfigError);
 
   // 合法配置不应写入错误
