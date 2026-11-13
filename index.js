@@ -19,8 +19,13 @@
  */
 
 import { spawn } from 'node:child_process';
-import { request as httpRequest } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, accessSync, constants } from 'node:fs';
+import { request as httpRequest, get as httpsGet } from 'node:https';
+import {
+  existsSync, mkdirSync, readFileSync, writeFileSync, accessSync, constants,
+  createWriteStream, createReadStream, mkdtempSync, rmSync, statSync, renameSync, readdirSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
 import { createServer as createNetServer, connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { resolve, join, dirname, isAbsolute } from 'node:path';
@@ -165,6 +170,213 @@ function ensureEditorSettings(userDataDir, config) {
   } catch { /* 设置写入失败不应阻止编辑器启动 */ }
 }
 
+// ---------------------------------------------------------------------------
+// 运行时自举：缺 code-server 时自动下载并校验
+// ---------------------------------------------------------------------------
+
+/** 下载限制：防止被超大文件或被拖死的连接拖垮整个 DSH 启动。 */
+const RUNTIME_LIMITS = {
+  maxBytes: 200 * 1024 * 1024,
+  timeoutMs: 5 * 60 * 1000,
+};
+
+/**
+ * 判断运行时当前该做什么。纯函数，方便离线测试各种配置组合。
+ *
+ * @param {Record<string, unknown>} config 已校验的配置
+ * @returns {{action: 'ready'|'install'|'missing', entry: string, runtimeDir: string,
+ *            source?: string, sha256?: string, hint: string}}
+ */
+export function planRuntime(config = {}) {
+  const runtimeDir = expand(config.runtimeDir || '~/.dsh/editor-runtime');
+  const entry = findEntry(runtimeDir);
+  if (entry) {
+    return { action: 'ready', entry, runtimeDir, hint: '' };
+  }
+  const source = config.runtimeSource ? String(config.runtimeSource) : '';
+  const sha256 = config.runtimeSha256 ? String(config.runtimeSha256) : '';
+  if (!source || !sha256) {
+    // 没配来源时不要"尝试一下"：静默去下载未知二进制比明确报错危险得多。
+    return {
+      action: 'missing',
+      entry: '',
+      runtimeDir,
+      hint: `在 ${runtimeDir} 下找不到 out/node/entry.js。`
+        + ' 可配置 runtimeSource + runtimeSha256 让插件自动下载，或手动安装：'
+        + ` mkdir -p ${runtimeDir} && cd ${runtimeDir} && npm init -y && `
+        + 'FORCE_NODE_VERSION=24 npm install code-server@4.145.2',
+    };
+  }
+  return { action: 'install', entry: '', runtimeDir, source, sha256, hint: '' };
+}
+
+/** 计算文件 SHA-256（流式，避免把 200MB 包读进内存）。 */
+function sha256File(file) {
+  return new Promise((resolveHash, rejectHash) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(file);
+    stream.on('error', rejectHash);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolveHash(hash.digest('hex')));
+  });
+}
+
+/**
+ * 下载到本地文件，边下边算大小；超过上限立刻中断。
+ * @returns {Promise<{bytes: number}>}
+ */
+async function downloadToFile(url, dest, opts = {}) {
+  const limits = { ...RUNTIME_LIMITS, ...opts };
+  return new Promise((resolveDl, rejectDl) => {
+    const req = httpsGet(url, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        // 只跟随一次重定向：发行包通常直连，多次跳转多半是被劫持或配置错
+        downloadToFile(new URL(res.headers.location, url).toString(), dest, opts)
+          .then(resolveDl, rejectDl);
+        return;
+      }
+      if (status !== 200) {
+        res.resume();
+        rejectDl(new Error(`下载失败：HTTP ${status}`));
+        return;
+      }
+      const declared = Number(res.headers['content-length'] || 0);
+      if (declared > limits.maxBytes) {
+        res.resume();
+        rejectDl(new Error(`发行包过大（${declared} 字节，上限 ${limits.maxBytes}）`));
+        return;
+      }
+      let bytes = 0;
+      let aborted = false;
+      const out = createWriteStream(dest);
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > limits.maxBytes && !aborted) {
+          aborted = true;
+          req.destroy(new Error(`发行包超过上限 ${limits.maxBytes} 字节`));
+        }
+      });
+      pipeline(res, out)
+        .then(() => { if (aborted) rejectDl(new Error('发行包超过上限')); else resolveDl({ bytes }); })
+        .catch(rejectDl);
+    });
+    req.setTimeout(limits.timeoutMs, () => req.destroy(new Error('下载超时')));
+    req.on('error', rejectDl);
+  });
+}
+
+/** 用系统 tar 解包到目标目录（`tar` 在 macOS/Linux/Win10+ 都有）。 */
+function extractTar(tarPath, destDir) {
+  return new Promise((resolveTar, rejectTar) => {
+    const child = spawn('tar', ['-xzf', tarPath, '-C', destDir, '--strip-components=1'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr?.on('data', (c) => { stderr += c.toString(); });
+    child.on('error', rejectTar);
+    child.on('exit', (code) => {
+      if (code === 0) resolveTar();
+      else rejectTar(new Error(`解包失败（tar 退出码 ${code}）：${stderr.trim().slice(0, 300)}`));
+    });
+  });
+}
+
+/**
+ * 确保运行时可用：缺就下载 → 校验 → 解包 → 原子落位。
+ *
+ * 安全底线：
+ *   - 只接受 https（配置层已校验）
+ *   - **必须**有 SHA-256 且校验通过，否则一个字节都不会解包
+ *   - 先解到同目录的临时目录，成功后再 rename，失败不动已有安装
+ *
+ * IO 全部可注入（deps），这样离线也能测「校验不过就不落位」这类关键行为。
+ *
+ * @param {Record<string, unknown>} config 已校验配置
+ * @param {object} [deps] 测试注入点
+ * @returns {Promise<{state: string, entry?: string, message?: string}>}
+ */
+export async function ensureRuntime(config = {}, deps = {}) {
+  const {
+    fetchToFile = downloadToFile,
+    extract = extractTar,
+    hashFile = sha256File,
+    rename = renameSync,
+    log = () => {},
+  } = deps;
+
+  const plan = planRuntime(config);
+  if (plan.action === 'ready') return { state: 'ready', entry: plan.entry };
+  if (plan.action === 'missing') return { state: 'missing', message: plan.hint };
+
+  const { runtimeDir, source, sha256 } = plan;
+  log(`[editor-mode] 运行时缺失，开始下载 ${source}`);
+
+  // 目录都建不出来的话（权限/磁盘满）也要走 failed 而不是把异常抛给调用方，
+  // 否则会被上层当成"崩溃"而不断重试。
+  let work = '';
+  try {
+    mkdirSync(runtimeDir, { recursive: true });
+    work = mkdtempSync(join(runtimeDir, '.download-'));
+    const tarPath = join(work, 'runtime.tgz');
+    await fetchToFile(source, tarPath, RUNTIME_LIMITS);
+    log('[editor-mode] 下载完成，校验 SHA-256');
+
+    const actual = await hashFile(tarPath);
+    if (actual !== sha256) {
+      // 校验不过绝不落位：宁可这次失败，也不让来路不明的字节变成可执行运行时
+      throw new Error(`SHA-256 校验失败：期望 ${sha256}，实际 ${actual}`);
+    }
+
+    const staging = join(work, 'unpacked');
+    mkdirSync(staging, { recursive: true });
+    await extract(tarPath, staging);
+    if (!findEntry(staging)) {
+      throw new Error('发行包结构不符：解包后找不到 out/node/entry.js');
+    }
+
+    // 原子落位：同目录 rename。
+    // 注意顺序：旧安装先挪到 backup、再装新的。如果第二步失败，必须把 backup
+    // 挪回去——否则 finally 清掉 work 时会连备份一起删，用户既没有新安装、
+    // 旧的也没了（数据丢失）。
+    const target = join(runtimeDir, 'node_modules');
+    const stagedModules = join(staging, 'node_modules');
+    if (existsSync(stagedModules)) {
+      const backup = join(work, 'previous');
+      const hadOld = existsSync(target);
+      if (hadOld) rename(target, backup);
+      try {
+        rename(stagedModules, target);
+      } catch (err) {
+        if (hadOld && existsSync(backup)) {
+          try { rename(backup, target); } catch { /* 恢复也失败：下面照常报错 */ }
+        }
+        throw err;
+      }
+    } else {
+      for (const name of readdirSafe(staging)) {
+        renameSync(join(staging, name), join(runtimeDir, name));
+      }
+    }
+
+    const entry = findEntry(runtimeDir);
+    if (!entry) throw new Error('落位后仍找不到 out/node/entry.js');
+    log('[editor-mode] 运行时安装完成');
+    return { state: 'installed', entry };
+  } catch (err) {
+    log(`[editor-mode] 运行时安装失败：${String(err?.message || err)}`);
+    return { state: 'failed', message: String(err?.message || err) };
+  } finally {
+    // 临时目录一定要清：下载包有 200MB，失败时留在磁盘上会被反复堆积
+    if (work) { try { rmSync(work, { recursive: true, force: true }); } catch { /* 清理失败不影响结论 */ } }
+  }
+}
+
+function readdirSafe(dir) {
+  try { return readdirSync(dir); } catch { return []; }
+}
+
 /**
  * 启动 code-server。返回 { child, state }；失败时抛错，由 apply 转成可展示的状态。
  * 说明：本机 DSH 自带 node 带 hardened runtime，会拒绝加载 argon2 的第三方签名原生模块，
@@ -173,15 +385,22 @@ function ensureEditorSettings(userDataDir, config) {
  */
 async function startServer(config, ctx, bridge) {
   const runtimeDir = expand(config.runtimeDir || '~/.dsh/editor-runtime');
-  const entry = findEntry(runtimeDir);
-  if (!entry) {
+  // 缺运行时先自举（配置了 runtimeSource + runtimeSha256 时）；失败再抛可操作错误。
+  const ensured = await ensureRuntime(config, { log: (m) => ctx.logger?.info?.(m) });
+  if (ensured.state === 'missing' || ensured.state === 'failed') {
     // 这是唯一需要用户动手的失败，说清楚怎么做，别让它变成一块白屏。
-    throw new Error(
-      `code-server 未安装：在 ${runtimeDir} 下找不到 out/node/entry.js。`
-      + ` 安装：mkdir -p ${runtimeDir} && cd ${runtimeDir} && npm init -y && `
-      + 'FORCE_NODE_VERSION=24 npm install code-server@4.145.2',
+    const error = new Error(
+      ensured.state === 'missing'
+        ? ensured.message
+        : `code-server 自动安装失败：${ensured.message}。`
+          + ` 可手动安装：mkdir -p ${runtimeDir} && cd ${runtimeDir} && npm init -y && `
+          + 'FORCE_NODE_VERSION=24 npm install code-server@4.145.2',
     );
+    // 显式标记：重试不会让「运行时不存在」自愈。别再靠正则匹配文案判断。
+    error.retryable = false;
+    throw error;
   }
+  const entry = ensured.entry || findEntry(runtimeDir);
 
   const nodeBin = expand(config.nodeBin || '') || findNode();
   const host = config.upstreamHost || '127.0.0.1';
@@ -529,6 +748,9 @@ const CONFIG_SPEC = {
   // 注意：目录「存在与否」是运行时状态（首次使用还没装运行时），
   // 不是配置错误——判成致命错误会让「未安装 → 给安装指引」这条正常路径变成启动崩溃。
   runtimeDir: { kind: 'path', optional: true, hint: 'code-server 运行时目录（默认 ~/.dsh/editor-runtime）' },
+  // 自动下载用：只接受 https + 必须带 SHA-256，缺席即拒绝（见 ensureRuntime）
+  runtimeSource: { kind: 'httpsUrl', optional: true, hint: 'code-server 发行包 URL（首次启动自动下载）' },
+  runtimeSha256: { kind: 'sha256', optional: true, hint: '上述发行包的 SHA-256' },
   userDataDir: { kind: 'path', optional: true, hint: 'code-server 用户数据目录' },
   workspaceDir: { kind: 'path', optional: true, hint: '打开的项目目录' },
   upstreamHost: { kind: 'bindHost', default: '127.0.0.1', hint: 'code-server 监听地址' },
@@ -641,6 +863,26 @@ export function validateConfig(input = {}) {
         value[name] = token;
         break;
       }
+      case 'httpsUrl': {
+        const raw2 = String(raw);
+        let parsed2 = null;
+        try { parsed2 = new URL(raw2); } catch { /* 下面统一报错 */ }
+        if (!parsed2 || parsed2.protocol !== 'https:') {
+          errors.push(`${name}: 必须是 https URL，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+        } else {
+          value[name] = raw2;
+        }
+        break;
+      }
+      case 'sha256': {
+        const hex = String(raw).trim().toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(hex)) {
+          errors.push(`${name}: 必须是 64 位十六进制 SHA-256，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+        } else {
+          value[name] = hex;
+        }
+        break;
+      }
       case 'plainObject': {
         if (!isPlainObject(raw)) {
           errors.push(`${name}: 必须是对象，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
@@ -670,7 +912,8 @@ export function apply(ctx, rawConfig = {}) {
   if (errors.length > 0) {
     const detail = errors.map((e) => `  - ${e}`).join('\n');
     const message = `editor-mode: 配置有 ${errors.length} 处问题，插件未启动：\n${detail}`;
-    // 同时记到状态里：/editor-status 要能反映 failed + 原因，而不是一直 starting。
+    // 留一份面包屑（日志/测试用）。注意此刻还没注册任何路由，/editor-status
+    // 不可能读到它；配置错误的可见渠道是下面这条 throw 造成的插件激活失败。
     apply.lastConfigError = message;
     throw new Error(message);
   }
@@ -735,14 +978,14 @@ async function installEditor(ctx, config, webServer) {
       // 端口/工作目录来自上游实例，状态（starting/ready/degraded/restarting/failed）
       // 来自汇总状态 state0 —— 崩溃重启时必须反映「正在重试」而不是旧的 degraded。
       const s = runtime?.state ?? {};
-      // 配置非法时插件根本没装配起来：要让排障的人看到 failed + 原因，
-      // 而不是一个永远停在 starting 的状态。
-      const configError = apply.lastConfigError || '';
+      // 注意：配置非法时 apply() 会在注册本路由**之前**抛错，路由根本不存在，
+      // 所以这里读不到任何配置错误。配置问题的可见渠道是那条 throw 触发的
+      // 插件激活失败（DSH 日志里可见 `editor-mode: 配置有 N 处问题…`）。
       res.statusCode = 200;
       res.setHeader('content-type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
-        status: configError ? 'failed' : state0.status,
-        error: configError || state0.error,
+        status: state0.status,
+        error: state0.error,
         pid: runtime?.dead ? undefined : s.pid,
         upstream: s.upstream || state0.upstream || '',
         workspace: s.workspace || '',
@@ -884,8 +1127,9 @@ async function installEditor(ctx, config, webServer) {
       state0.error = String(err?.message || err);
       state0.log = String(err?.stack || err);
       ctx.logger?.warn?.(`[editor-mode] 启动失败：${state0.log}`);
-      // 运行时缺失 / 端口非法这类配置问题不会因为重试自愈，只提示不重试。
-      if (/未安装/.test(state0.error)) return;
+      // 运行时缺失 / 配置非法不会因为重试自愈，只提示不重试。
+      // 优先看显式标记（err.retryable === false）；正则只作为历史文案的兜底。
+      if (err?.retryable === false || /未安装/.test(state0.error)) return;
       scheduleRestart(state0.error);
     }
   };
