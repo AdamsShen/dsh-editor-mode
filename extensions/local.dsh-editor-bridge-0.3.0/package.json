@@ -17,7 +17,8 @@
     "onCommand:dshEditorBridge.focusChat",
     "onCommand:dshEditorBridge.sendExplorerFiles",
     "onCommand:dshEditorBridge.sendExplorerFolder",
-    "onCommand:dshEditorBridge.sendTerminalSelection"
+    "onCommand:dshEditorBridge.sendTerminalSelection",
+    "onCommand:dshEditorBridge.importRules"
   ],
   "contributes": {
     "viewsContainers": {
@@ -94,6 +95,11 @@
         "command": "dshEditorBridge.sendTerminalSelection",
         "title": "发送给 DSH Agents（终端选区）",
         "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.importRules",
+        "title": "把旧规则文件导入 AGENTS.md",
+        "category": "DSH"
       }
     ],
     "menus": {
@@ -119,6 +125,10 @@
         {
           "command": "dshEditorBridge.focusChat",
           "when": "true"
+        },
+        {
+          "command": "dshEditorBridge.importRules",
+          "group": "dsh@1"
         }
       ],
       "explorer/context": [

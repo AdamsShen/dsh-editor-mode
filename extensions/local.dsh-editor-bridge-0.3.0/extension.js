@@ -1039,6 +1039,105 @@ function collect(includeSelection) {
   return { file: info.file, line: info.line, text };
 }
 
+// ---------------------------------------------------------------------------
+// 项目规则：DSH 原生读 AGENTS.md / CLAUDE.md，这里只负责把旧约定搬过来
+// ---------------------------------------------------------------------------
+
+/**
+ * Cursor / Copilot 时代的规则文件。DSH 的 `agent-instructions` 只认
+ * `AGENTS.md` / `CLAUDE.md`（含 `.local` 覆盖），这些文件它读不到，
+ * 所以从 Cursor 迁过来的人会「规则突然不生效」。
+ */
+const LEGACY_RULE_FILES = ['.cursorrules', '.github/copilot-instructions.md', 'CODEBUDDY.md'];
+
+/** 导入段落用固定标记包裹，便于重复执行时跳过、也便于人工识别来源。 */
+const RULE_MARK = (rel) => `<!-- dsh-import: ${rel} -->`;
+
+/**
+ * 扫描工作区根部的旧规则文件，返回 [{ rel, abs, content }]。
+ * 只读不写；`.cursor/rules/*.mdc` 一并纳入（Cursor 新版目录式规则）。
+ *
+ * @param {string} root 工作区根目录绝对路径
+ * @returns {{rel: string, abs: string, content: string}[]}
+ */
+function readLegacyRuleFiles(root) {
+  const targets = LEGACY_RULE_FILES.map((rel) => ({ rel, abs: path.join(root, rel) }));
+  try {
+    const dir = path.join(root, '.cursor', 'rules');
+    for (const name of fs.readdirSync(dir)) {
+      if (name.endsWith('.mdc')) {
+        targets.push({ rel: `.cursor/rules/${name}`, abs: path.join(dir, name) });
+      }
+    }
+  } catch { /* 没有目录式规则 */ }
+
+  const found = [];
+  for (const t of targets) {
+    try {
+      if (!fs.statSync(t.abs).isFile()) continue;
+      const content = fs.readFileSync(t.abs, 'utf8');
+      if (content.trim()) found.push({ ...t, content });
+    } catch { /* 不存在或不可读，跳过 */ }
+  }
+  return found;
+}
+
+/**
+ * 去掉 Cursor `.mdc` 顶部的 YAML frontmatter。
+ *
+ * 为什么必须去：`.mdc` 的 frontmatter 是 Cursor 专有语义
+ * （`globs` 决定作用范围、`alwaysApply` 决定是否常驻），DSH 完全不认。
+ * 原样搬进 AGENTS.md 只会让模型读到一段像分隔线又像 YAML 的噪声。
+ *
+ * @param {string} text
+ * @returns {{body: string, stripped: boolean}}
+ */
+function stripMdcFrontmatter(text) {
+  const match = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(text);
+  if (!match) return { body: text, stripped: false };
+  return { body: text.slice(match[0].length), stripped: true };
+}
+
+/**
+ * 把旧规则文件导入工作区根的 `AGENTS.md`。
+ *
+ * 为什么是「导入」而不是「每次发消息注入」：DSH 已把 AGENTS.md 作为持久上下文
+ * 加载，自己再拼一份会重复注入并打乱它的优先级（项目 > 全局）。
+ *
+ * 非破坏性：只追加、不覆盖；带标记的段落不会重复写入。
+ * 已导入的来源即使内容更新也不会重写——避免覆盖用户手改过的版本。
+ *
+ * @param {string} root 工作区根目录绝对路径
+ * @returns {{imported: string[], skipped: string[], target: string}}
+ */
+function importLegacyRules(root) {
+  const target = path.join(root, 'AGENTS.md');
+  let existing = '';
+  try { existing = fs.readFileSync(target, 'utf8'); } catch { /* 首次创建 */ }
+
+  const imported = [];
+  const skipped = [];
+  let next = existing;
+
+  for (const file of readLegacyRuleFiles(root)) {
+    if (next.includes(RULE_MARK(file.rel))) { skipped.push(file.rel); continue; }
+    const isMdc = file.rel.endsWith('.mdc');
+    const { body, stripped } = isMdc
+      ? stripMdcFrontmatter(file.content)
+      : { body: file.content, stripped: false };
+    // frontmatter-only 的文件没有实际规则，不写空段落
+    if (!body.trim()) continue;
+    const header = `<!-- 由 DSH 编辑器模式从 ${file.rel} 导入。改规则请优先改这里。 -->`
+      + (stripped ? '\n<!-- 已忽略原文件的 YAML frontmatter（globs / alwaysApply 是 Cursor 专有语义） -->' : '');
+    const section = `${RULE_MARK(file.rel)}\n\n${header}\n\n${body.replace(/\s+$/, '')}\n`;
+    next = next ? `${next.replace(/\s+$/, '')}\n\n${section}` : section;
+    imported.push(file.rel);
+  }
+
+  if (imported.length > 0) fs.writeFileSync(target, next, 'utf8');
+  return { imported, skipped, target };
+}
+
 /**
  * 把绝对路径转成相对工作区的 POSIX 路径（与编辑器内 `file:line` 的写法一致）。
  *
@@ -1077,6 +1176,37 @@ function activate(context) {
     } else {
       vscode.window.showWarningMessage('DSH Agents 通道未就绪');
     }
+  };
+
+  /**
+   * 把旧的 Cursor/Copilot 规则文件导入 AGENTS.md（DSH 原生读它）。
+   * 只追加不覆盖，重复执行不会重复写入。
+   */
+  const importRules = () => {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    if (!root) {
+      vscode.window.showInformationMessage('没有打开的工作区');
+      return;
+    }
+    let result;
+    try {
+      result = importLegacyRules(root);
+    } catch (err) {
+      vscode.window.showWarningMessage(`导入规则失败：${String(err?.message || err)}`);
+      return;
+    }
+    if (result.imported.length === 0 && result.skipped.length === 0) {
+      vscode.window.showInformationMessage(
+        '没找到旧约定规则文件（.cursorrules / .github/copilot-instructions.md / CODEBUDDY.md）。'
+        + 'DSH 会原生读取项目根的 AGENTS.md 与 CLAUDE.md。',
+      );
+      return;
+    }
+    if (result.imported.length === 0) {
+      vscode.window.showInformationMessage(`这些规则已经导入过了：${result.skipped.join('、')}`);
+      return;
+    }
+    vscode.window.setStatusBarMessage(`已导入 ${result.imported.length} 个规则文件到 AGENTS.md`, 3000);
   };
 
   /** 右键回调的 uri 取法：优先「全部选中项」，空数组时退回单个 uri。 */
@@ -1211,6 +1341,7 @@ function activate(context) {
     vscode.commands.registerCommand('dshEditorBridge.sendTerminalSelection', () => {
       void sendTerminalSelection();
     }),
+    vscode.commands.registerCommand('dshEditorBridge.importRules', () => importRules()),
     vscode.commands.registerCommand('dshEditorBridge.askSelection', () => { void askSelection(); }),
     vscode.commands.registerCommand('dshEditorBridge.newChat', () => {
       void provider.newChat();
