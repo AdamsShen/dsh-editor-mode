@@ -250,6 +250,21 @@ console.log('本轮改动卡片');
   } catch (err) { crashed = err; }
   check('文件项为 null 时不抛错', !crashed, crashed && String(crashed.message));
   const rowsAfter = walk(nodes.get('log')).filter((n) => n.className === 'changes-row');
+  console.log('MCP 工具来源标识');
+  {
+    emit({
+      type: 'state', sessionId: 'session-abc-123', sessionTitle: 'MCP',
+      messages: [{ role: 'assistant', parts: [
+        { type: 'tool', callId: 'c1', name: 'mcp__postgres-prod__query', mcpServer: 'postgres-prod', mcpTool: 'query', summary: '', status: 'done' },
+        { type: 'tool', callId: 'c2', name: 'bash', summary: '', status: 'done' },
+      ], reasoning: '' }],
+      busy: false,
+    });
+    const badges = walk(nodes.get('log')).filter((n) => n.className === 'tool-mcp');
+    check('只有 MCP 工具带服务标识', badges.length === 1, String(badges.length));
+    check('标识显示服务名', String(badges[0]?.textContent).includes('postgres-prod'), badges[0]?.textContent);
+  }
+
   check('异常项仍渲染成一行', rowsAfter.length === 2, String(rowsAfter.length));
 }
 

@@ -433,6 +433,11 @@ class ChatViewProvider {
       case 'openFile':
         await this.openFile(String(message.path || ''), Number(message.line) || 1);
         break;
+      case 'pickRef': {
+        const picked = await this.pickReference(message.query);
+        if (picked) this.post({ type: 'insertRef', ref: picked });
+        break;
+      }
       case 'openChangeDiff':
         await this.openChangeDiff(
           String(message.sessionId || this.sessionId || ''),
@@ -719,10 +724,14 @@ class ChatViewProvider {
           const callId = String(payload.callId || '');
           const msg = this.messages[index];
           if (!msg.parts.some((p) => p.type === 'tool' && p.callId === callId)) {
+            const toolName = String(payload.toolName || payload.name || '工具');
+            const mcp = parseMcpTool(toolName);
             msg.parts.push({
               type: 'tool',
               callId,
-              name: String(payload.toolName || payload.name || '工具'),
+              name: toolName,
+              // 来自 MCP 的工具额外标注服务名，便于判断数据来自哪个外部系统
+              ...(mcp ? { mcpServer: mcp.server, mcpTool: mcp.tool } : {}),
               summary: sessionView.formatArgs(payload.arguments ?? payload.input),
               result: '',
               status: 'running',
@@ -826,6 +835,81 @@ class ChatViewProvider {
    * @param {number} seq       workspace/changes 事件的序列号
    * @param {number} index     文件在 summary.files 里的下标
    */
+  /**
+   * `@` 引用选择器：按 query 列出工作区文件、目录与符号。
+   *
+   * 三类分开给（QuickPick 分组），因为用途不同：文件/目录交给 Agent 自己读，
+   * 符号用来精确定位到某个函数而不是整文件。
+   *
+   * @param {string} query 用户在 `@` 后面输入的部分
+   * @returns {Promise<string|null>} 选中项的引用文本（不含 `@`），取消返回 null
+   */
+  async pickReference(query) {
+    const q = String(query || '').trim().toLowerCase();
+    const matches = (text) => !q || text.toLowerCase().includes(q);
+
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const items = [];
+
+    // 文件：工作区扫描（排除依赖与构建产物，避免一次列出几万个）
+    let files = [];
+    try {
+      files = await vscode.workspace.findFiles(
+        '**/*', '**/{node_modules,.git,dist,build,out,.next,target}/**', 200,
+      );
+    } catch { /* 工作区过大或不可读时降级为只有符号 */ }
+
+    const rel = (uri) => toWorkspacePath(uri?.fsPath || uri?.path || '');
+    const fileRels = files.map(rel).filter(Boolean);
+
+    // 目录：从文件路径反推，省掉一遍递归读盘
+    const dirs = [...new Set(fileRels.flatMap((r) => {
+      const parts = r.split('/');
+      return parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'));
+    }))].sort();
+
+    for (const r of fileRels) {
+      if (matches(r)) items.push({ label: `$(file) ${r}`, ref: r, kind: 'file' });
+      if (items.length >= 60) break;
+    }
+    for (const d of dirs) {
+      if (items.length >= 80) break;
+      if (matches(d)) items.push({ label: `$(folder) ${d}/`, ref: d, kind: 'folder' });
+    }
+
+    // 符号：走 VS Code 自己的 workspace symbol provider（语言服务提供，最准）
+    if (q) {
+      try {
+        const symbols = await vscode.commands.executeCommand('vscode.executeWorkspaceSymbolProvider', q);
+        for (const sym of Array.isArray(symbols) ? symbols.slice(0, 30) : []) {
+          const loc = sym?.location?.uri || sym?.location?.targetUri;
+          const file = rel(loc);
+          const line = (sym?.location?.range?.start?.line ?? 0) + 1;
+          if (!file) continue;
+          items.push({
+            label: `$(symbol-method) ${sym.name}`,
+            description: `${file}:${line}`,
+            // 用 file:line 形式：与正文里的跳转链接同一套语法，Agent 也认
+            ref: `${file}:${line}`,
+            kind: 'symbol',
+          });
+          if (items.length >= 100) break;
+        }
+      } catch { /* 没有语言服务时只给文件 */ }
+    }
+
+    if (items.length === 0) {
+      vscode.window.showInformationMessage('没有匹配的文件、目录或符号');
+      return null;
+    }
+
+    const picked = await vscode.window.showQuickPick(items, {
+      placeHolder: folder ? `引用文件 / 目录 / 符号（${folder}）` : '引用文件 / 目录 / 符号',
+      matchOnDescription: true,
+    });
+    return picked?.ref || null;
+  }
+
   async openChangeDiff(sessionId, seq, index) {
     if (!sessionId || !Number.isSafeInteger(seq) || !Number.isSafeInteger(index)) return;
     let payload;
@@ -1134,7 +1218,21 @@ function importLegacyRules(root) {
     imported.push(file.rel);
   }
 
-  if (imported.length > 0) fs.writeFileSync(target, next, 'utf8');
+  if (imported.length > 0) {
+    // 原子写：先写同目录临时文件再 rename。
+    // 直接 writeFileSync 会先截断目标文件，中途崩溃/断电会把用户已有的
+    // AGENTS.md 变成半个文件；rename 在同一文件系统内是原子的，失败时
+    // 原文件保持完好。
+    const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      fs.writeFileSync(tmp, next, 'utf8');
+      fs.renameSync(tmp, target);
+    } catch (err) {
+      // 清理临时文件，但不掩盖真正的失败原因。
+      try { fs.unlinkSync(tmp); } catch { /* 清理失败忽略 */ }
+      throw err;
+    }
+  }
   return { imported, skipped, target };
 }
 
@@ -1154,7 +1252,116 @@ function toWorkspacePath(fsPath) {
   return fsPath;
 }
 
-/** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 */
+// ---------------------------------------------------------------------------
+// 行内补全（P3-3）
+// ---------------------------------------------------------------------------
+
+/** 补全开关与节流参数。 */
+const COMPLETION = {
+  debounceMs: 120,        // 连续敲字时不立刻请求
+  minIntervalMs: 400,     // 两次请求的最小间隔，兜住高频输入
+  maxLineChars: 2000,     // 超长行不发（多半是压缩产物或数据）
+};
+
+/**
+ * 行内补全 provider。
+ *
+ * 设计取舍：
+ * - **失败一律静默**：补全报错弹窗会打断打字，比没有补全更糟
+ * - **只对代码文件生效**：Markdown/纯文本里补全容易给出噪音
+ * - **节流 + 取消**：每次输入都发请求会把后端打满，且旧请求要能作废
+ * - 光标在行首或紧跟缩进时不请求：此时几乎必然是在写结构性代码，
+ *   模型给出的续写价值低、误触率高
+ */
+class CompletionProvider {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.lastAt = 0;
+    this.seq = 0;
+  }
+
+  /** 判断是否值得为这个位置请求补全。 */
+  shouldSuggest(document, position) {
+    if (document.uri.scheme !== 'file') return false;
+    const lang = document.languageId || '';
+    if (['markdown', 'plaintext', 'log', 'jsonl'].includes(lang)) return false;
+    const line = document.lineAt(position.line).text;
+    if (line.length > COMPLETION.maxLineChars) return false;
+    // 行内已有内容且光标不在末尾（中间编辑）时跳过：续写在中间几乎总是错的
+    if (position.character < line.length) return false;
+    return true;
+  }
+
+  async provideInlineCompletionItems(document, position, _context, token) {
+    // 默认关闭：补全会持续调用模型，应由用户显式开启
+    const enabled = vscode.workspace.getConfiguration('dshEditorBridge')
+      .get('inlineCompletion.enabled', false);
+    if (!enabled) return undefined;
+    if (!this.shouldSuggest(document, position)) return undefined;
+
+    const now = Date.now();
+    if (now - this.lastAt < COMPLETION.minIntervalMs) return undefined;
+    this.lastAt = now;
+
+    // 取消：用户继续打字时，旧的补全请求要尽快作废
+    const mySeq = (this.seq += 1);
+    const cancelled = () => token?.isCancellationRequested || this.seq !== mySeq;
+
+    await new Promise((resolve) => setTimeout(resolve, COMPLETION.debounceMs));
+    if (cancelled()) return undefined;
+
+    const offset = document.offsetAt(position);
+    const text = document.getText();
+    const prefix = text.slice(Math.max(0, offset - 4000), offset);
+    const suffix = text.slice(offset, offset + 1000);
+
+    let json;
+    try {
+      const res = await sessionView.request(channel(), 'POST', '/editor-completion', {
+        prefix, suffix,
+        language: document.languageId || '',
+        file: toWorkspacePath(document.uri.fsPath || ''),
+      }, 2000);
+      if (res.status !== 200) return undefined;
+      json = res.json;
+    } catch {
+      return undefined;   // 静默：补全不可用不该打断用户
+    }
+    if (cancelled()) return undefined;
+
+    const suggestion = String(json?.text || '');
+    if (!suggestion.trim()) return undefined;
+
+    return [{
+      insertText: suggestion,
+      range: new vscode.Range(position, position),
+    }];
+  }
+}
+
+/**
+ * 解析 MCP 工具名，取出服务名与原始工具名。
+ *
+ * DSH 把 MCP 工具统一暴露为 `mcp__<serverName>__<原始工具名>`（见 ~/.dsh/cordis.patch.yml 注释）。
+ * 侧栏需要这个信息才能把「来自外部服务」的工具和本地工具区分开——
+ * 用户看到一个陌生的工具名时，应该能立刻知道它来自哪个 MCP 服务。
+ *
+ * @param {string} name 工具名
+ * @returns {{server: string, tool: string} | null} 非 MCP 工具返回 null
+ */
+function parseMcpTool(name) {
+  const raw = String(name || '');
+  const m = /^mcp__(.+?)__(.+)$/.exec(raw);
+  if (m) return { server: m[1], tool: m[2] };
+  // DSH 在名字超过 64 字符时会截断并追加哈希（见 dsh-mcp-client 的
+  // publicToolName）。极长 server 名被截掉后半段时，`__` 分隔符可能正好
+  // 落在截断处，上面的正则就失配了。此时退化成「只标出这是 MCP 工具」：
+  // 保不住服务名，但至少要让人知道它不是本地工具，而不是静默当成普通工具。
+  if (/^mcp__/.test(raw)) return { server: '', tool: raw.slice(5) };
+  return null;
+}
+
+/** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 *//** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 *//** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 *//** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 */
 function formatPayload(file, line, text) {
   const loc = file ? `@${file}${line ? `:${line}` : ''}` : '';
   if (!text) return loc ? `请看一下 ${loc}` : '';
@@ -1342,6 +1549,11 @@ function activate(context) {
       void sendTerminalSelection();
     }),
     vscode.commands.registerCommand('dshEditorBridge.importRules', () => importRules()),
+    // 行内补全：只在支持的语言里注册（provider 内部还会再过滤一次）
+    vscode.languages.registerInlineCompletionItemProvider(
+      [{ scheme: 'file' }],
+      new CompletionProvider(context),
+    ),
     vscode.commands.registerCommand('dshEditorBridge.askSelection', () => { void askSelection(); }),
     vscode.commands.registerCommand('dshEditorBridge.newChat', () => {
       void provider.newChat();
@@ -1385,5 +1597,6 @@ module.exports = {
   formatPayload,
   parseSseBlock,
   channel,
+  parseMcpTool,
   foldEvents: sessionView.foldEvents,
 };

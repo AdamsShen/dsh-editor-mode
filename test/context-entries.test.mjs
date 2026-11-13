@@ -91,6 +91,7 @@ const vscode = {
       writeText: async (v) => { clipboardText = v; clipboardWrites.push(v); },
     },
   },
+  languages: { registerInlineCompletionItemProvider: () => ({ dispose() {} }) },
   commands: {
     registerCommand: (id, fn) => { commands[id] = fn; return { dispose() {} }; },
     executeCommand: async (cmd) => {

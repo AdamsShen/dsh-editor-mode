@@ -149,6 +149,16 @@
           "group": "dsh@1"
         }
       ]
-    }
+    },
+    "configuration": {
+      "properties": {
+        "dshEditorBridge.inlineCompletion.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "启用行内代码补全（Tab 接受、Esc 取消）。默认关闭：补全会持续调用模型，按需开启。"
+        }
+      }
+    },
+    "keybindings": []
   }
 }

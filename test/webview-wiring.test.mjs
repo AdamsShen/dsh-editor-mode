@@ -157,6 +157,16 @@ check('history 加载有代号守卫', extensionSrc.includes('historyGen')
   && extensionSrc.includes('me !== this.historyGen'));
 check('过期加载结果被丢弃', /if \(me !== this\.historyGen\) return;/.test(extensionSrc));
 
+// P1-1：@ 引用的消息通道两端必须成对，否则「选了但没插入」
+check('webview 会发起 pickRef', chatSrc.includes("type: 'pickRef'"));
+check('扩展处理 pickRef', extensionSrc.includes("case 'pickRef'"));
+check('扩展回传 insertRef', extensionSrc.includes("type: 'insertRef'"));
+check('webview 处理 insertRef', chatSrc.includes("case 'insertRef'"));
+check('扩展有引用选择器', extensionSrc.includes('async pickReference('));
+check('选择器含文件/目录/符号三类',
+  extensionSrc.includes('findFiles(') && extensionSrc.includes('executeWorkspaceSymbolProvider'));
+
+
 check('扩展没有把 token 放进 post 的消息',
   !/post\(\{[^}]*token/.test(extensionSrc),
   'token 只应在 Node 侧使用');

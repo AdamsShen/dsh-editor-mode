@@ -17,7 +17,7 @@
  *
  * 用法：node test/rules-import.test.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,6 +71,7 @@ const vscode = {
     getConfiguration: () => ({ get: () => undefined }),
   },
   env: { clipboard: { readText: async () => '', writeText: async () => {} } },
+  languages: { registerInlineCompletionItemProvider: () => ({ dispose() {} }) },
   commands: {
     registerCommand: (id, fn) => { commands[id] = fn; return { dispose() {} }; },
     executeCommand: async () => {},
@@ -149,6 +150,10 @@ try {
     check('导入 CODEBUDDY.md', out.includes('提交前跑 lint'));
     check('每段带来源标记', (out.match(/<!-- dsh-import: /g) || []).length === 4,
       String((out.match(/<!-- dsh-import: /g) || []).length));
+    // 原子写：rename 完成后不应残留临时文件
+    check('没有残留临时文件',
+      readdirSync(root).every((n) => !n.startsWith('AGENTS.md.tmp-')),
+      readdirSync(root).join(','));
     // .mdc 的 Cursor 专有 frontmatter 不能污染 AGENTS.md
     check('剥离了 globs', !out.includes('globs:'), out.split('\n').filter((l) => l.includes('globs')).join('|'));
     check('剥离了 alwaysApply', !out.includes('alwaysApply:'), '');

@@ -905,6 +905,123 @@ export function validateConfig(input = {}) {
   return { value, errors, warnings };
 }
 
+// ---------------------------------------------------------------------------
+// 行内补全（P3-3）：独立于会话的轻量调用
+// ---------------------------------------------------------------------------
+
+/**
+ * 补全请求的预算与限制。
+ *
+ * 为什么这些数字必须很小：补全是「打字时每几秒一次」的高频操作，
+ * 一旦单次就慢或贵，用户会先感觉到卡顿、再感觉到账单。
+ */
+/** 服务端同时处理的补全请求上限（见 /editor-completion 的限流注释）。 */
+const COMPLETION_SERVER_MAX = 2;
+
+const COMPLETION_LIMITS = {
+  maxPrefixChars: 4000,      // 上下文预算：只带光标前的有限正文
+  maxSuffixChars: 1000,      // 光标后少量，帮模型知道不要重复
+  maxTokens: 80,             // 补全只该给一两行
+  timeoutMs: 1500,           // 超时就当没有建议，不阻塞用户
+};
+
+/**
+ * 从 DSH 的 `llm` 服务取一份补全。
+ *
+ * 不能复用 `/editor-sessions/stream`：那条路径要经过会话、工具、权限、
+ * 事件广播，秒级延迟；补全需要的是「直连模型 + 极短输出」。
+ *
+ * @param {object} deps { llm, provider, model }
+ * @param {object} req { prefix, suffix, language, file }
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<string>} 补全文本（失败或超时返回空串）
+ */
+export async function requestCompletion(deps, req, signal) {
+  const { llm, provider, model } = deps;
+  if (!llm?.prepareCall) return '';
+
+  const prefix = String(req?.prefix ?? '').slice(-COMPLETION_LIMITS.maxPrefixChars);
+  const suffix = String(req?.suffix ?? '').slice(0, COMPLETION_LIMITS.maxSuffixChars);
+  if (!prefix.trim()) return '';
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener?.('abort', onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(), COMPLETION_LIMITS.timeoutMs);
+
+  try {
+    // abort 只是"请求取消"的信号，若底层根本不响应它（例如适配器网络挂起），
+    // await 会永远不返回，补全请求也就永不结束。这里再做一层硬 race，
+    // 保证请求方一定能在预算内拿到结果。
+    const prepared = await Promise.race([
+      llm.prepareCall(provider, model, controller.signal),
+      new Promise((_, reject) => {
+        const t = setTimeout(() => reject(new Error('prepare 超时')), COMPLETION_LIMITS.timeoutMs);
+        controller.signal.addEventListener('abort', () => {
+          clearTimeout(t);
+          reject(new Error('已取消'));
+        }, { once: true });
+      }),
+    ]);
+    const messages = [{
+      role: 'user',
+      // 只给最少信息：文件语言 + 光标前后。给太多反而让模型去「总结」而不是续写。
+      content: [
+        `语言：${req?.language || '未知'}；文件：${req?.file || '未命名'}`,
+        '请在光标处续写代码，只输出要插入的内容本身（不要解释、不要重复已有代码、不要代码块标记）。',
+        '<cursor_before>',
+        prefix,
+        '</cursor_before>',
+        '<cursor_after>',
+        suffix,
+        '</cursor_after>',
+      ].join('\n'),
+    }];
+
+    let text = '';
+    const stream = prepared.stream({
+      messages,
+      maxTokens: COMPLETION_LIMITS.maxTokens,
+      signal: controller.signal,
+    });
+    for await (const chunk of stream) {
+      const delta = chunk?.delta?.text ?? chunk?.text ?? '';
+      if (delta) text += delta;
+      if (text.length > 400) break;   // 防止模型无视 maxTokens 长篇输出
+    }
+    return cleanCompletion(text, prefix, suffix);
+  } catch {
+    // 补全失败必须静默：任何一次报错弹窗都会打断用户打字
+    return '';
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener?.('abort', onAbort);
+  }
+}
+
+/**
+ * 清洗模型输出：去掉代码块围栏、重复的前缀、以及明显不是续写的内容。
+ *
+ * 模型常见坏习惯（不清理会直接显示成幽灵文本）：
+ *   - 把整个代码块用 ``` 包起来
+ *   - 从头重抄上一行
+ *   - 直接输出文件剩余部分
+ */
+export function cleanCompletion(raw, prefix, suffix) {
+  let text = String(raw ?? '');
+  // 去掉 ```lang ... ``` 围栏
+  text = text.replace(/^\s*```[a-zA-Z0-9-]*\n?/, '').replace(/\n?```\s*$/, '');
+  // 去掉与光标前内容重复的尾巴（模型常重抄最后一行）
+  const lastLine = prefix.slice(prefix.lastIndexOf('\n') + 1);
+  if (lastLine && text.startsWith(lastLine)) text = text.slice(lastLine.length);
+  // 如果模型把光标后的内容也吐出来了，截掉
+  if (suffix) {
+    const at = text.indexOf(suffix.slice(0, Math.min(20, suffix.length)));
+    if (at > 0) text = text.slice(0, at);
+  }
+  return text.replace(/\s+$/, '');
+}
+
 export function apply(ctx, rawConfig = {}) {
   // 启动即校验：非法配置在这里一次性报全，不要留到 spawn 阶段变成白屏。
   const { value: config, errors, warnings } = validateConfig(rawConfig);
@@ -1060,6 +1177,76 @@ async function installEditor(ctx, config, webServer) {
     ctx, webServer, token: bridgeToken, deps: { loopbackOnly, tokenFromRequest, readJsonBody, sseWriter },
   });
   ctx.effect(() => () => disposeSessions());
+
+  // 调模型的并发池：补全与 NES 共用。
+  // 必须在两个 handler 之前声明 —— 虽然闭包实际执行时已初始化，
+  // 但把"能用"寄托在求值顺序上太脆弱，读代码的人也无从判断。
+  let completionInflight = 0;
+
+  // ---- 行内补全端点 ----
+  // 独立于会话流：补全是毫秒级需求，走 /editor-sessions/stream 会慢一个数量级。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/editor-completion',
+    handler: async (req, res) => {
+      if (!bridgeAllowed(req)) { res.writeHead(403); res.end(); return; }
+      if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+      const read = await readJsonBody(req, 256 * 1024);
+      if (read.tooLarge) { res.writeHead(413); res.end(); return; }
+      if (read.invalid) {
+        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: '请求体不是合法 JSON' }));
+        return;
+      }
+      const body = read.value || {};
+      const llm = ctx.get('llm');
+      if (!llm?.prepareCall) {
+        res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'DSH 未提供 llm 服务，补全不可用' }));
+        return;
+      }
+      // 用当前默认模型；拿不到就当没有补全，不要报错打断用户
+      let provider = body?.provider || '';
+      let model = body?.model || '';
+      try {
+        if (!provider || !model) {
+          const def = ctx.get('defaultModel')?.get?.();
+          provider = provider || def?.provider || '';
+          model = model || def?.model || '';
+        }
+      } catch { /* 忽略 */ }
+      if (!provider || !model) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ text: '', reason: 'no-model' }));
+        return;
+      }
+
+      // 服务端也要限流：补全在打字时是高频调用，客户端节流不能当成保证
+      // （任何持 token 的本地进程都能直接打这个端点）。超限直接返回空建议，
+      // 让用户那边表现为"暂时没补全"，而不是把模型配额打光。
+      if (completionInflight >= COMPLETION_SERVER_MAX) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ text: '', reason: 'busy' }));
+        return;
+      }
+
+      const controller = new AbortController();
+      req.on('close', () => controller.abort());
+      completionInflight += 1;
+      let text = '';
+      try {
+        text = await requestCompletion({ llm, provider, model }, body, controller.signal);
+      } finally {
+        completionInflight -= 1;
+      }
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('cache-control', 'no-store');
+      res.end(JSON.stringify({ text }));
+    },
+  }), 'editor-mode: POST /editor-completion');
 
   // 主反代路由：所有 /editor/ 下的 HTTP 请求。
   ctx.effect(() => webServer.register({

@@ -60,6 +60,7 @@ const vscode = {
     activeTextEditor: undefined,
     createOutputChannel: () => ({ appendLine() {}, info() {}, warn() {}, error() {} }),
   },
+  languages: { registerInlineCompletionItemProvider: () => ({ dispose() {} }) },
   commands: {
     registerCommand: () => ({ dispose() {} }),
     executeCommand: async () => {},
