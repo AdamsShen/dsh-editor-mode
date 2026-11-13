@@ -248,15 +248,12 @@ function collectContext() {
   const doc = editor.document;
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
   const fsPath = doc.uri.scheme === 'file' ? doc.uri.fsPath : '';
-  let file = doc.uri.toString();
-  if (fsPath) {
-    file = folder && fsPath.startsWith(folder)
-      ? path.relative(folder, fsPath).split(path.sep).join('/')
-      : fsPath;
-  }
+  // 非 file 协议（如 diff 虚拟文档）保留完整 uri；file 走统一相对化，
+  // 避免与 toWorkspacePath 出现两套不一致的路径口径。
+  const file = fsPath ? toWorkspacePath(fsPath) : doc.uri.toString();
   const sel = editor.selection;
   const hasSelection = Boolean(sel && !sel.isEmpty);
-  const text = hasSelection ? doc.getText(sel).slice(0, MESSAGE_MAX) : '';
+  const text = hasSelection ? doc.getText(sel).slice(0, BRIDGE_TEXT_LIMIT) : '';
   return {
     file,
     line: sel ? sel.start.line + 1 : 1,
@@ -1042,6 +1039,22 @@ function collect(includeSelection) {
   return { file: info.file, line: info.line, text };
 }
 
+/**
+ * 把绝对路径转成相对工作区的 POSIX 路径（与编辑器内 `file:line` 的写法一致）。
+ *
+ * 注意不能只用 `startsWith(folder)`：`/repo-other/a.js` 也以 `/repo` 开头，
+ * 会被错算成相对路径 `../repo-other/a.js`。必须要求目录边界。
+ */
+function toWorkspacePath(fsPath) {
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  if (!fsPath) return '';
+  const prefix = folder.endsWith(path.sep) ? folder : folder + path.sep;
+  if (folder && (fsPath === folder || fsPath.startsWith(prefix))) {
+    return path.relative(folder, fsPath).split(path.sep).join('/');
+  }
+  return fsPath;
+}
+
 /** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 */
 function formatPayload(file, line, text) {
   const loc = file ? `@${file}${line ? `:${line}` : ''}` : '';
@@ -1061,6 +1074,100 @@ function activate(context) {
     const formatted = formatPayload(data.file, data.line, data.text);
     if (pushToAgents({ file: data.file, line: data.line, text: formatted })) {
       vscode.window.setStatusBarMessage('已发送给 DSH Agents', 2000);
+    } else {
+      vscode.window.showWarningMessage('DSH Agents 通道未就绪');
+    }
+  };
+
+  /** 右键回调的 uri 取法：优先「全部选中项」，空数组时退回单个 uri。 */
+  const pickUris = (uri, uris) => {
+    if (Array.isArray(uris) && uris.length > 0) return uris;
+    return uri ? [uri] : [];
+  };
+
+  /**
+   * 把资源管理器里选中的文件/文件夹作为引用发给 DSH Agents。
+   *
+   * 为什么只送路径不送内容：侧栏 Chat 是真实 Agent 会话，它自己会按路径读文件，
+   * 塞进正文既浪费上下文预算，又会让多选时超出单条消息上限。
+   *
+   * @param {any[]} uris 资源管理器右键时传入的 uri 数组（支持多选）
+   * @param {'file'|'folder'} kind 选中的是文件还是目录
+   */
+  const sendExplorerPaths = (uris, kind) => {
+    const list = Array.isArray(uris) ? uris : (uris ? [uris] : []);
+    const rels = list
+      .map((u) => toWorkspacePath(u?.fsPath || u?.path || ''))
+      .filter(Boolean);
+    if (rels.length === 0) {
+      vscode.window.showInformationMessage('没有选中文件');
+      return;
+    }
+    const head = kind === 'folder'
+      ? `请看一下这些目录：\n`
+      : (rels.length > 1 ? `请看一下这些文件：\n` : '');
+    // 逐项累加，超预算就停下并说明还剩多少：一把梭 join 再让 Host 截断，
+    // 会把最后一条路径切成半截。
+    const lines = [];
+    let used = head.length;
+    for (const r of rels) {
+      const line = `@${r}`;
+      if (used + line.length + 1 > BRIDGE_TEXT_LIMIT) break;
+      lines.push(line);
+      used += line.length + 1;
+    }
+    const rest = rels.length - lines.length;
+    const tail = rest > 0 ? `…（其余 ${rest} 项未列出）\n` : '';
+    const text = `${head}${lines.join('\n')}\n${tail}`;
+    if (pushToAgents({ file: rels[0], line: 0, text })) {
+      vscode.window.setStatusBarMessage(`已发送 ${rels.length} 项给 DSH Agents`, 2000);
+    } else {
+      vscode.window.showWarningMessage('DSH Agents 通道未就绪');
+    }
+  };
+
+  /**
+   * 把终端里选中的内容发给 DSH Agents。
+   *
+   * VS Code 没有公开「读取终端选区」的 API，通行做法是触发
+   * `workbench.action.terminal.copySelection` 再读剪贴板。任一环节不可用
+   * （命令缺席、剪贴板被禁）都退化成明确提示，不静默失败。
+   */
+  const sendTerminalSelection = async () => {
+    if (!vscode.window.activeTerminal) {
+      vscode.window.showInformationMessage('没有活动的终端');
+      return;
+    }
+    const clipboard = vscode.env?.clipboard;
+    // 读选区要借剪贴板：先存下用户原本的内容，用完还回去。
+    // 不还的话，用户此前复制的东西会被这个命令悄悄覆盖掉。
+    let previous = '';
+    let previousSaved = false;
+    try {
+      previous = await clipboard?.readText?.() ?? '';
+      previousSaved = true;
+    } catch { /* 剪贴板不可读，就不还原 */ }
+
+    let text = '';
+    try {
+      await vscode.commands.executeCommand('workbench.action.terminal.copySelection');
+      text = await clipboard?.readText?.() ?? '';
+    } catch { /* 命令或剪贴板不可用，下面统一提示 */ } finally {
+      if (previousSaved) {
+        try { await clipboard?.writeText?.(previous); } catch { /* 还原失败不影响主流程 */ }
+      }
+    }
+    text = String(text || '').trim();
+    if (!text) {
+      vscode.window.showInformationMessage('终端里没有选中内容');
+      return;
+    }
+    const clipped = text.length > BRIDGE_TEXT_LIMIT
+      ? `${text.slice(0, BRIDGE_TEXT_LIMIT)}\n…（已截断）`
+      : text;
+    const payload = `来自终端的选中内容：\n\`\`\`\n${clipped}\n\`\`\`\n`;
+    if (pushToAgents({ file: '', line: 0, text: payload })) {
+      vscode.window.setStatusBarMessage('已发送终端选区给 DSH Agents', 2000);
     } else {
       vscode.window.showWarningMessage('DSH Agents 通道未就绪');
     }
@@ -1093,6 +1200,17 @@ function activate(context) {
     vscode.commands.registerCommand('dshEditorBridge.sendSelection', () => send(true)),
     vscode.commands.registerCommand('dshEditorBridge.sendFile', () => send(false)),
     // 资源管理器 / 终端入口（P1-2）：把选中项作为 @路径 引用送给 Agents
+    // 右键可能传 (uri) 或 (uri, 全部选中项)。注意不能用 `uris || [uri]`：
+    // 多选回调里 uris 可能是空数组（truthy），会把单选的那个 uri 丢掉。
+    vscode.commands.registerCommand('dshEditorBridge.sendExplorerFiles', (uri, uris) => {
+      sendExplorerPaths(pickUris(uri, uris), 'file');
+    }),
+    vscode.commands.registerCommand('dshEditorBridge.sendExplorerFolder', (uri, uris) => {
+      sendExplorerPaths(pickUris(uri, uris), 'folder');
+    }),
+    vscode.commands.registerCommand('dshEditorBridge.sendTerminalSelection', () => {
+      void sendTerminalSelection();
+    }),
     vscode.commands.registerCommand('dshEditorBridge.askSelection', () => { void askSelection(); }),
     vscode.commands.registerCommand('dshEditorBridge.newChat', () => {
       void provider.newChat();

@@ -14,7 +14,10 @@
     "onCommand:dshEditorBridge.sendFile",
     "onCommand:dshEditorBridge.askSelection",
     "onCommand:dshEditorBridge.newChat",
-    "onCommand:dshEditorBridge.focusChat"
+    "onCommand:dshEditorBridge.focusChat",
+    "onCommand:dshEditorBridge.sendExplorerFiles",
+    "onCommand:dshEditorBridge.sendExplorerFolder",
+    "onCommand:dshEditorBridge.sendTerminalSelection"
   ],
   "contributes": {
     "viewsContainers": {
@@ -76,6 +79,21 @@
         "command": "dshEditorBridge.focusChat",
         "title": "打开 DSH Chat",
         "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.sendExplorerFiles",
+        "title": "发送给 DSH Agents（选中文件）",
+        "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.sendExplorerFolder",
+        "title": "发送给 DSH Agents（选中目录）",
+        "category": "DSH"
+      },
+      {
+        "command": "dshEditorBridge.sendTerminalSelection",
+        "title": "发送给 DSH Agents（终端选区）",
+        "category": "DSH"
       }
     ],
     "menus": {
@@ -101,6 +119,24 @@
         {
           "command": "dshEditorBridge.focusChat",
           "when": "true"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "dshEditorBridge.sendExplorerFiles",
+          "group": "dsh@1",
+          "when": "explorerResourceIsFolder == false"
+        },
+        {
+          "command": "dshEditorBridge.sendExplorerFolder",
+          "group": "dsh@1",
+          "when": "explorerResourceIsFolder == true"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "dshEditorBridge.sendTerminalSelection",
+          "group": "dsh@1"
         }
       ]
     }

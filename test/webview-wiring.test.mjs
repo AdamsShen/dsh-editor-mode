@@ -80,6 +80,20 @@ const menuCommands = [
   ...(manifest.contributes.menus?.['editor/context'] || []),
   ...(manifest.contributes.menus?.['view/title'] || []),
 ].map((item) => item.command);
+// P1-2：资源管理器 / 终端入口 —— 菜单声明必须有对应实现
+for (const [menu, cmd] of [
+  ['explorer/context', 'dshEditorBridge.sendExplorerFiles'],
+  ['explorer/context', 'dshEditorBridge.sendExplorerFolder'],
+  ['terminal/context', 'dshEditorBridge.sendTerminalSelection'],
+]) {
+  const declared = (manifest.contributes.menus[menu] || []).some((m) => m.command === cmd);
+  check(`${menu} 声明了 ${cmd.split('.')[1]}`, declared);
+  check(`${cmd} 在代码里注册`, extensionSrc.includes(`registerCommand('${cmd}'`));
+}
+check('资源管理器入口按文件/目录分派',
+  /explorerResourceIsFolder == (false|true)/.test(JSON.stringify(manifest.contributes.menus['explorer/context'])));
+check('终端选区读到空内容时给提示', extensionSrc.includes('终端里没有选中内容'));
+
 check('菜单只引用已声明的命令',
   menuCommands.every((id) => commandIds.includes(id)),
   menuCommands.join(', '));
