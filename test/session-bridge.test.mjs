@@ -13,7 +13,12 @@
  *
  * 用法：node test/session-bridge.test.mjs
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { registerSessionRoutes } from '../sessions.js';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 let failed = 0;
 function check(name, condition, detail) {
@@ -247,6 +252,26 @@ console.log('实时流：三类帧 → SSE');
   check('工具事件带 name', toolEvent[1].data.name === 'read_file');
 }
 
+console.log('实时流：workspace/changes 必须放行并带 seq');
+{
+  // 只断言白名单字符串不够：过滤逻辑本身坏了照样漏。这里让 follow 真产出
+  // 一个 workspace/changes，断言它出现在 SSE 里且 seq 原样透传。
+  const followWithChanges = async function* () {
+    yield { type: 'event', event: { seq: 33, type: 'workspace/changes', data: { turn: 1 } } };
+    yield { type: 'event', event: { seq: 34, type: 'system/message', data: { big: 'x'.repeat(100) } } };
+  };
+  services = { sessionController: makeController({ follow: followWithChanges }) };
+  const r = await run('/editor-sessions/stream', { url: `/editor-sessions/stream?sessionId=s1&token=${TOKEN}` });
+  const events = parseEvents(r.text());
+  const changes = events.filter((e) => e[0] === 'session-event' && e[1].type === 'workspace/changes');
+  check('changes 事件出现在流里', changes.length === 1, String(changes.length));
+  check('changes 事件带 seq', changes[0]?.[1]?.seq === 33, String(changes[0]?.[1]?.seq));
+  check('changes 事件带 turn', changes[0]?.[1]?.data?.turn === 1);
+  // 仍是白名单制：system/message 不该被放行（否则每条流放大一个量级）
+  const sys = events.filter((e) => e[0] === 'session-event' && e[1].type === 'system/message');
+  check('system/message 仍被过滤', sys.length === 0, String(sys.length));
+}
+
 console.log('服务缺失：显式 503');
 {
   services = {};
@@ -255,6 +280,96 @@ console.log('服务缺失：显式 503');
   check('503 带原因', String(JSON.parse(r.text()).error).includes('sessionController'));
   const r2 = await run('/editor-sessions/stream', { url: `/editor-sessions/stream?sessionId=s1&token=${TOKEN}` });
   check('stream 503', r2.statusCode === 503, String(r2.statusCode));
+}
+
+console.log('Agent 改动：白名单 + changes 端点');
+{
+  // workspace/changes 必须被放行，否则前端拿不到「本轮改动」卡片。
+  // 白名单是模块私有常量，直接读源码断言，避免为测试而扩大导出面。
+  const srcText = readFileSync(join(HERE, '..', 'sessions.js'), 'utf8');
+  const whitelist = srcText.slice(
+    srcText.indexOf('const UI_EVENT_TYPES = new Set(['),
+    srcText.indexOf(']);', srcText.indexOf('const UI_EVENT_TYPES = new Set([')),
+  );
+  check("workspace/changes 在白名单", whitelist.includes("'workspace/changes'"));
+
+  const summary = {
+    turn: 1,
+    total: 2,
+    added: 18,
+    deleted: 3,
+    files: [
+      { path: '/repo/a/sessions.js', display: 'sessions.js', added: 12, deleted: 2 },
+      { path: '/repo/a/chat.js', display: 'chat.js', added: 6, deleted: 1, binary: true },
+    ],
+  };
+  const diffs = new Map();
+  diffs.set('0', {
+    kind: 'text', path: '/repo/a/sessions.js', display: 'sessions.js',
+    before: true, after: true, coarse: false,
+    hunks: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' a', '-b', '+B', ' c'] }],
+  });
+  diffs.set('1', { kind: 'binary', path: '/repo/a/chat.js', display: 'chat.js' });
+
+  services = {
+    sessionController: makeController(),
+    workspaceChanges: {
+      summary: (sessionId, seq) => (sessionId === 's1' && seq === 27 ? summary : undefined),
+      diff: async (sessionId, seq, index) => {
+        if (sessionId !== 's1' || seq !== 27) return undefined;
+        return diffs.get(String(index));
+      },
+    },
+  };
+
+  const ok = await run('/editor-sessions/changes', { url: `/editor-sessions/changes?sessionId=s1&seq=27&token=${TOKEN}` });
+  check('changes 200', ok.statusCode === 200, String(ok.statusCode));
+  const body = JSON.parse(ok.text());
+  check('changes 带 turn/total', body.turn === 1 && body.total === 2);
+  check('changes 带增删行数', body.added === 18 && body.deleted === 3);
+  check('changes 文件列表 2 条', body.files.length === 2);
+  check('changes 保留 display 名', body.files[0].display === 'sessions.js');
+  check('changes 保留 binary 标记', body.files[1].binary === true);
+
+  const stale = await run('/editor-sessions/changes', { url: `/editor-sessions/changes?sessionId=s1&seq=99&token=${TOKEN}` });
+  check('过期记录 404（不返回空列表）', stale.statusCode === 404, String(stale.statusCode));
+
+  const badSeq = await run('/editor-sessions/changes', { url: `/editor-sessions/changes?sessionId=s1&seq=abc&token=${TOKEN}` });
+  check('非法 seq 400', badSeq.statusCode === 400, String(badSeq.statusCode));
+
+  // Number(null) === 0 会把「没传」当成「传了 0」，必须显式识别为 400
+  const noSeq = await run('/editor-sessions/changes', { url: `/editor-sessions/changes?sessionId=s1&token=${TOKEN}` });
+  check('缺 seq → 400（不是 404）', noSeq.statusCode === 400, String(noSeq.statusCode));
+  const emptySeq = await run('/editor-sessions/changes', { url: `/editor-sessions/changes?sessionId=s1&seq=&token=${TOKEN}` });
+  check('空 seq → 400', emptySeq.statusCode === 400, String(emptySeq.statusCode));
+
+  const noAuth = await run('/editor-sessions/changes', { url: '/editor-sessions/changes?sessionId=s1&seq=27' });
+  check('缺 token 401', noAuth.statusCode === 401, String(noAuth.statusCode));
+
+  const d0 = await run('/editor-sessions/changes/diff', { url: `/editor-sessions/changes/diff?sessionId=s1&seq=27&index=0&token=${TOKEN}` });
+  check('diff 200', d0.statusCode === 200, String(d0.statusCode));
+  const diffBody = JSON.parse(d0.text());
+  check('diff kind=text', diffBody.kind === 'text');
+  check('diff 带 hunks', Array.isArray(diffBody.hunks) && diffBody.hunks.length === 1);
+  check('diff before/after 是布尔', diffBody.before === true && diffBody.after === true);
+
+  const d1 = await run('/editor-sessions/changes/diff', { url: `/editor-sessions/changes/diff?sessionId=s1&seq=27&index=1&token=${TOKEN}` });
+  check('二进制文件仍是 200 + kind', d1.statusCode === 200 && JSON.parse(d1.text()).kind === 'binary');
+
+  const badIndex = await run('/editor-sessions/changes/diff', { url: `/editor-sessions/changes/diff?sessionId=s1&seq=27&index=x&token=${TOKEN}` });
+  check('非法 index 400', badIndex.statusCode === 400, String(badIndex.statusCode));
+
+  // 缺 index 若被当成 0，会静默返回**另一个文件**的 diff —— 必须挡住
+  const noIndex = await run('/editor-sessions/changes/diff', { url: `/editor-sessions/changes/diff?sessionId=s1&seq=27&token=${TOKEN}` });
+  check('缺 index → 400（不静默取 0）', noIndex.statusCode === 400, String(noIndex.statusCode));
+  const noSeq2 = await run('/editor-sessions/changes/diff', { url: `/editor-sessions/changes/diff?sessionId=s1&index=0&token=${TOKEN}` });
+  check('diff 缺 seq → 400', noSeq2.statusCode === 400, String(noSeq2.statusCode));
+
+  // workspaceChanges 缺失 → 503 且有原因，不静默
+  services = { sessionController: makeController() };
+  const gone = await run('/editor-sessions/changes', { url: `/editor-sessions/changes?sessionId=s1&seq=27&token=${TOKEN}` });
+  check('无 workspaceChanges 时 503', gone.statusCode === 503, String(gone.statusCode));
+  check('503 说明改动服务缺失', String(JSON.parse(gone.text()).error).includes('改动'));
 }
 
 console.log(failed === 0 ? 'PASS: 会话桥契约全部通过' : `FAIL: ${failed} 项失败`);

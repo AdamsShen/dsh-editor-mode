@@ -224,6 +224,41 @@ function foldEvents(events) {
       continue;
     }
 
+    if (type === 'workspace/changes') {
+      // 事件只有 {turn}，文件列表要按 seq 再查一次。这里先占位，
+      // 由调用方（extension.loadHistory）统一补全，保持 foldEvents 纯函数。
+      const seq = Number(event?.seq);
+      if (!Number.isSafeInteger(seq) || seq < 0) continue;
+      // 归属：优先当前正在累积的助手消息；否则挂到最近一条助手消息。
+      //
+      // 为什么不直接用 ensureAssistant()：DSH 可能在 turn/end **之后**才发出
+      // 这个事件。此时 current 已被清空，ensureAssistant() 会新开一条只有
+      // 改动卡片的空气泡；更糟的是若下一轮的用户消息已经到了，卡片会被挂到
+      // 新一轮下面 —— 等于把这次改动算到了错误的回合。
+      let target = current && current.role === 'assistant' ? current : null;
+      if (!target) {
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (messages[i].role === 'assistant') { target = messages[i]; break; }
+        }
+      }
+      // 整段里根本没有助手消息（极端情况）：自己造一条，但不接管 current，
+      // 免得把下一轮的文字追加进这条占位消息。
+      if (!target) target = push(newMessage('assistant'));
+      if (!target.parts.some((p) => p.type === 'changes' && p.seq === seq)) {
+        target.parts.push({
+          type: 'changes',
+          seq,
+          turn: Number(data?.turn) || 0,
+          added: 0,
+          deleted: 0,
+          total: 0,
+          files: [],
+          pending: true,
+        });
+      }
+      continue;
+    }
+
     if (type === 'turn/end') {
       // 一轮结束：把还挂在 running 的工具标成结束，避免 UI 一直转圈。
       for (const tool of toolIndex.values()) {
@@ -249,6 +284,137 @@ function summarizeToolResult(content) {
   return text.length > TOOL_RESULT_MAX ? `${text.slice(0, TOOL_RESULT_MAX)}\n…（已截断）` : text;
 }
 
+/**
+ * hunks 里的「无末尾换行」标记行。
+ *
+ * DSH 的 hunk 来自 jsdiff 的 structuredPatch：文件末尾缺少换行时，它会在
+ * `hunks[].lines` 里插入一行 `\ No newline at end of file`。这一行不是内容
+ * （jsdiff 自己统计行号时也把它排除），必须同时从「旧侧还原」和「新侧行数」
+ * 里剔除；否则「末尾没有换行的文件」会被一律判成与磁盘不一致而打不开对比。
+ *
+ * 判定用首字符：hunk 里的内容行一定以 ' '、'+'、'-' 开头，所以以 '\' 开头的
+ * 只可能是这个标记。
+ *
+ * @param {unknown} line
+ * @returns {boolean}
+ */
+const isNoNewlineMarker = (line) => typeof line === 'string' && line.startsWith('\\');
+
+/**
+ * 从 hunks 反推「改动前」的整文件内容。
+ *
+ * 为什么需要反推：DSH 的 `workspaceChanges.diff()` 只回 hunks 与
+ * `before: boolean` / `after: boolean`（是否存在），**不回两侧原文**。
+ * 而原生 `vscode.diff` 需要两份完整文档。好在 hunks 来自 `structuredPatch`
+ * （3 行上下文、行号 1-based），配合磁盘上的当前内容可以精确还原。
+ *
+ * 做法：按 hunk 的倒序，把「新文件」里 [newStart, newStart+newLines) 这段
+ * 替换成 hunk 里属于旧侧的行（上下文行 + `-` 行），前面未覆盖的区域两侧相同。
+ *
+ * @param {string[]} afterLines 当前文件按行切分（不含行尾换行）
+ * @param {Array<{newStart:number,newLines:number,lines:string[]}>} hunks
+ * @returns {string[]} 改动前的行
+ */
+function invertHunks(afterLines, hunks) {
+  const before = afterLines.slice();
+  const list = Array.isArray(hunks) ? hunks : [];
+  // 倒序改，避免前面的替换把后面 hunk 的下标顶掉。
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const hunk = list[i] || {};
+    const newStart = Number(hunk.newStart) || 0;
+    const newLines = Number(hunk.newLines) || 0;
+    if (newStart < 1) continue;
+    const body = Array.isArray(hunk.lines) ? hunk.lines : [];
+    // 旧侧 = 上下文行（' '）+ 删除行（'-'），去掉前缀，剔除无末尾换行标记。
+    const oldSide = body
+      .filter((line) => typeof line === 'string' && line[0] !== '+' && !isNoNewlineMarker(line))
+      .map((line) => (line.length > 0 ? line.slice(1) : ''));
+    const from = newStart - 1;
+    // 用 splice 精确替换；newLines 与 oldSide 长度本应一致，
+    // 万一 DSH 侧口径变化，以 splice 的显式范围为准（宁可错位也不整篇崩）。
+    before.splice(from, newLines, ...oldSide);
+  }
+  return before;
+}
+
+/**
+ * 取某次改动的文件列表。
+ * @param {{base:string,token:string}} channel
+ * @param {string} sessionId
+ * @param {number} seq workspace/changes 事件的序列号
+ */
+async function fetchChanges(channel, sessionId, seq) {
+  const q = new URLSearchParams({ sessionId: String(sessionId), seq: String(seq) });
+  return request(channel, 'GET', `/editor-sessions/changes?${q}`);
+}
+
+/**
+ * 取某个文件的前后对比。
+ * @param {{base:string,token:string}} channel
+ * @param {string} sessionId
+ * @param {number} seq
+ * @param {number} index 该文件在 summary.files 里的下标
+ */
+async function fetchChangeDiff(channel, sessionId, seq, index) {
+  const q = new URLSearchParams({
+    sessionId: String(sessionId), seq: String(seq), index: String(index),
+  });
+  return request(channel, 'GET', `/editor-sessions/changes/diff?${q}`);
+}
+
+/**
+ * 校验 hunks 的「新侧」是否与磁盘当前内容逐行对齐。
+ *
+ * 为什么必须校验：`before` 是由 hunks 反推的，`after` 取的是磁盘当前内容。
+ * 如果该轮之后文件又被改过（用户手改、或后续回合），两者就不再是同一时刻的
+ * 两个版本 —— 拼出来的 diff 会把「本轮改动」和「之后的改动」混在一起，
+ * 却仍然标成「本轮改动」，属于**误导性展示**。宁可不给，也不给错的。
+ *
+ * @param {string[]} afterLines 磁盘当前内容按行切分
+ * @param {Array<{newStart:number,newLines:number,lines:string[]}>} hunks
+ * @returns {boolean} 每个 hunk 的新侧都能在磁盘内容里对上
+ */
+function hunksMatchContent(afterLines, hunks) {
+  const list = Array.isArray(hunks) ? hunks : [];
+  const lines = Array.isArray(afterLines) ? afterLines : [];
+  for (const hunk of list) {
+    const newStart = Number(hunk?.newStart) || 0;
+    const newLines = Number(hunk?.newLines) || 0;
+    if (newStart < 1) return false;
+    const expected = (Array.isArray(hunk?.lines) ? hunk.lines : [])
+      .filter((line) => typeof line === 'string' && line[0] !== '-' && !isNoNewlineMarker(line))
+      .map((line) => (line.length > 0 ? line.slice(1) : ''));
+    if (expected.length !== newLines) return false;
+    const actual = lines.slice(newStart - 1, newStart - 1 + newLines);
+    if (actual.length !== expected.length) return false;
+    for (let i = 0; i < expected.length; i += 1) {
+      if (actual[i] !== expected[i]) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 按 DSH 的口径把文本切成行：**只按 `"\n"` 切，保留行尾的 `"\r"`**。
+ *
+ * 为什么不能用 `/\r?\n/`：DSH 的 `lines()` 等价于
+ * `text.slice(0, -1).split("\n")`（它先 `terminated()` 补一个 `\n`），
+ * CRLF 文件切出来的每一行行尾是带 `"\r"` 的。如果我们把 `"\r"` 去掉，
+ * hunks 里的行就永远对不上磁盘内容 —— 一致性校验会把**所有 CRLF 文件**
+ * 误判成「本轮之后又被改过」，于是全部拒绝打开。
+ *
+ * 空文本按 DSH 的口径是 0 行。
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+function splitLines(text) {
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  if (raw === '') return [];
+  const body = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+  return body.split('\n');
+}
+
 module.exports = {
   request,
   streamSession,
@@ -257,5 +423,11 @@ module.exports = {
   formatArgs,
   summarizeToolResult,
   newMessage,
+  fetchChanges,
+  fetchChangeDiff,
+  invertHunks,
+  hunksMatchContent,
+  isNoNewlineMarker,
+  splitLines,
   HISTORY_PAGE,
 };

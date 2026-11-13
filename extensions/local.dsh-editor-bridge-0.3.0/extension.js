@@ -30,13 +30,58 @@ const crypto = require('node:crypto');
 const { parseSseBlock, createSseParser } = require('./sse.js');
 const sessionView = require('./session-view.js');
 
+/**
+ * 「AI 改动」虚拟文档的 scheme。
+ *
+ * 为什么用虚拟文档而不是临时文件：vscode.diff 需要两份可寻址的文档，
+ * 而「改动前」的内容只存在于 DSH 的改动记录里（磁盘上没有）。
+ * 注册一个只读 provider 按 key 取文本，既不用落盘，也不用管清理，
+ * 这也是 CodeBuddy（genie-diff）用的同一套机制。
+ */
+const DIFF_SCHEME = 'dsh-changes';
+
+/** key → 文本。provider 只服务内存里已登记的内容，不落盘。 */
+const diffDocuments = new Map();
+
+/**
+ * 内存里最多保留多少份虚拟文档（before + after 各算一份）。
+ *
+ * 为什么必须设上限：每份是整文件文本，一个 500KB 的文件开一次 diff 就占 1MB。
+ * 长会话里不断点开不同文件会持续累积。diff 编辑器一旦打开，VS Code 会自己
+ * 缓存文档内容，所以这里的条目只用于「首次取内容」，回收是安全的。
+ */
+const DIFF_DOC_MAX = 32;
+
+/** 单调递增的 key 序列，避免同一毫秒内两次打开互相覆盖。 */
+let diffDocSeq = 0;
+
+/** 登记一份虚拟文档内容，并淘汰最旧的，保证内存有界。 */
+function rememberDiffDoc(key, text) {
+  diffDocuments.set(key, text);
+  while (diffDocuments.size > DIFF_DOC_MAX) {
+    const oldest = diffDocuments.keys().next();
+    if (oldest.done) break;
+    diffDocuments.delete(oldest.value);
+  }
+}
+
+/** 虚拟文档 provider：只读、按 key 取文本，未登记返回空串。 */
+const diffContentProvider = {
+  provideTextDocumentContent(uri) {
+    const text = diffDocuments.get(uri.path) ?? '';
+    return text;
+  },
+};
+
 
 const VIEW_ID = 'dshEditor.chat';
 const STATE_KEY = 'dshEditor.chat.v1';
 /** 持久化的对话上限（条）。超出从最旧的丢，避免 globalState 无限膨胀。 */
 const HISTORY_MAX = 60;
-/** 单条消息发给模型前的长度上限（防止某条超长粘贴撑爆请求）。 */
-const MESSAGE_MAX = 20000;
+// 发给 DSH Agents 的正文上限，必须与 Host 的 BRIDGE_TEXT_MAX（index.js:708）一致。
+// 客户端不先按它裁剪的话，超长内容会被 Host 从中间直接切断，
+// 结果可能是半行代码或半条路径——看起来像内容损坏。
+const BRIDGE_TEXT_LIMIT = 8000;
 
 // ---------------------------------------------------------------------------
 // 通道解析：env 优先，文件兜底
@@ -305,7 +350,14 @@ class ChatViewProvider {
       .replace(/\{\{styleUri\}\}/g, uri('chat.css'));
     webview.html = html;
 
-    webview.onDidReceiveMessage((message) => { void this.onMessage(message); });
+    // 兜住任何处理器冒出来的异常：这里是 void 调用，不接住就会变成
+// 未处理的 Promise 拒绝（扩展宿主只写日志，用户毫无反馈）。
+    webview.onDidReceiveMessage((message) => {
+      void this.onMessage(message).catch((err) => {
+        this.error = String(err?.message || err);
+        this.postState();
+      });
+    });
     const track = (visible) => {
       if (!visible) return;
       this.visibleId = webviewView.viewType || VIEW_ID;
@@ -383,6 +435,13 @@ class ChatViewProvider {
         break;
       case 'openFile':
         await this.openFile(String(message.path || ''), Number(message.line) || 1);
+        break;
+      case 'openChangeDiff':
+        await this.openChangeDiff(
+          String(message.sessionId || this.sessionId || ''),
+          Number(message.seq),
+          Number(message.index),
+        );
         break;
       default:
         break;
@@ -466,17 +525,78 @@ class ChatViewProvider {
   /** 读历史页并折叠成消息。 */
   async loadHistory() {
     if (!this.sessionId) return;
+    // 加载代号：并发加载（快速切 tab、视图刚显示又刷新）时，
+    // 只让最新一次生效，避免旧响应把新列表覆盖掉。
+    const me = (this.historyGen = (this.historyGen || 0) + 1);
     try {
       const { status, json } = await sessionView.request(
         channel(), 'GET', `/editor-sessions/history?sessionId=${encodeURIComponent(this.sessionId)}`,
       );
       if (status !== 200) throw new Error(json?.error || `HTTP ${status}`);
+      if (me !== this.historyGen) return; // 已有更新的加载，丢弃这份过期结果
       const events = Array.isArray(json?.events) ? json.events : [];
       this.messages = sessionView.foldEvents(events);
       this.postState();
+      // 折叠出来的改动卡片只有 seq 占位，文件列表要再查（同一个 seq 并发去重）。
+      void this.fillPendingChanges(me);
     } catch (err) {
+      if (me !== this.historyGen) return;
       this.fail(err);
     }
+  }
+
+  /**
+   * 补全历史里所有 pending 的改动卡片。
+   *
+   * 为什么单独一趟：foldEvents 保持纯函数（不碰网络），
+   * 而 summary 必须按 (sessionId, seq) 逐个取。
+   * 取不到的（记录已过期）就保持 pending=false + files 为空，
+   * 由前端显示「记录已过期」而不是一张空卡。
+   */
+  async fillPendingChanges(gen) {
+    if (!this.sessionId) return;
+    const targets = [];
+    for (const msg of this.messages) {
+      for (const part of msg.parts || []) {
+        if (part.type === 'changes' && part.pending) targets.push(part);
+      }
+    }
+    if (targets.length === 0) return;
+    await Promise.all(targets.map(async (part) => {
+      try {
+        const res = await sessionView.fetchChanges(channel(), this.sessionId, part.seq);
+        part.pending = false;
+        if (res.status !== 200) {
+          // 区分失败原因：503 是「DSH 没提供这个服务」，404 才是记录过期。
+          // 之前一律显示「已过期」，排查时会把人带偏。
+          part.emptyReason = res.status === 404 ? 'expired'
+            : res.status === 503 ? 'unavailable' : 'failed';
+          return;
+        }
+        const files = Array.isArray(res.json?.files) ? res.json.files : [];
+        if (files.length === 0) part.emptyReason = 'none';
+        part.turn = Number(res.json?.turn) || part.turn;
+        part.added = Number(res.json?.added) || 0;
+        part.deleted = Number(res.json?.deleted) || 0;
+        part.total = Number(res.json?.total) || files.length;
+        part.files = files.map((f) => ({
+          path: String(f?.path || ''),
+          display: String(f?.display || f?.path || ''),
+          added: Number(f?.added) || 0,
+          deleted: Number(f?.deleted) || 0,
+          binary: f?.binary === true,
+          oversized: f?.oversized === true,
+        }));
+      } catch {
+        part.pending = false;
+        part.emptyReason = 'failed';
+      }
+    }));
+    // 期间若有更新的加载把 this.messages 整个换掉了，这里补全作用在已废弃的
+    // 对象上；再 postState 会把新列表里仍处于 pending 的卡片重新画一次，
+    // 表现是「永远停在正在读取」。交给最新那一代去补。
+    if (gen !== undefined && gen !== this.historyGen) return;
+    this.postState();
   }
 
   /** 把标题改成会话真实标题（从列表里取）。 */
@@ -557,7 +677,15 @@ class ChatViewProvider {
         const events = Array.isArray(data?.events) ? data.events : [];
         if (events.length) {
           const folded = sessionView.foldEvents(events);
-          if (folded.length) this.messages = folded;
+          if (folded.length) {
+            this.messages = folded;
+            // 折叠出来的改动卡片只有 seq 占位（pending），必须补全文件列表，
+            // 否则重连后这些卡会永远停在「正在读取改动…」——只有 loadHistory
+            // 会补，而重连走的是 snapshot，不是 loadHistory。
+            // 顺带自增代号，让更早那轮 loadHistory 的补全结果作废。
+            const gen = (this.historyGen = (this.historyGen || 0) + 1);
+            void this.fillPendingChanges(gen);
+          }
         }
         this.postState();
         break;
@@ -622,6 +750,9 @@ class ChatViewProvider {
           this.streamingIndex = -1;
           this.postState();
           void this.listSessions();
+        } else if (type === 'workspace/changes') {
+          // 事件本身只有 {turn}，文件列表要按 (sessionId, seq) 再查一次。
+          void this.attachChanges(Number(data?.seq));
         } else if (type === 'session/title') {
           this.sessionTitle = String(payload.title || '');
           this.postState();
@@ -665,6 +796,190 @@ class ChatViewProvider {
       await sessionView.request(channel(), 'POST', '/editor-sessions/cancel', { sessionId: this.sessionId });
     } catch { /* 通道已断也要把 UI 复位 */ }
     this.detach();
+    this.postState();
+  }
+
+  /**
+   * 改动文件里的 `path` 是相对「该会话的 cwd」的，不是相对当前编辑器工作区。
+   *
+   * 为什么不能直接用 workspaceFolders[0]：历史覆盖层列出的是**全部工作区**的
+   * 会话，从别的工作区打开一条会话再看改动，基准目录就错了，会读到错误的文件
+   * （或者读不到）。会话 cwd 在 /editor-sessions/list 的 items 里就有。
+   *
+   * @param {string} sessionId
+   * @returns {string} 解析相对路径用的基准目录
+   */
+  baseDirFor(sessionId) {
+    const hit = (this.sessions || []).find((s) => s && s.id === sessionId);
+    const cwd = typeof hit?.cwd === 'string' ? hit.cwd : '';
+    if (cwd) return cwd;
+    // 会话列表还没加载（或该会话不在最近一页）时退回当前工作区。
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  }
+
+  /**
+   * 打开某个改动文件的原生前后对比。
+   *
+   * 数据来源与形状（DSH workspaceChanges.diff）：
+   *   { kind:'text', path, display, before:boolean, after:boolean, hunks, coarse }
+   * `before`/`after` 只表示该侧是否存在，**不是内容**；内容靠
+   * 「磁盘当前内容 + hunks 反推」还原（见 session-view.invertHunks）。
+   *
+   * @param {string} sessionId 会话 id
+   * @param {number} seq       workspace/changes 事件的序列号
+   * @param {number} index     文件在 summary.files 里的下标
+   */
+  async openChangeDiff(sessionId, seq, index) {
+    if (!sessionId || !Number.isSafeInteger(seq) || !Number.isSafeInteger(index)) return;
+    let payload;
+    try {
+      const { status, json } = await sessionView.fetchChangeDiff(channel(), sessionId, seq, index);
+      if (status !== 200) {
+        vscode.window.showWarningMessage(
+          status === 404 ? '该改动的记录已过期，无法对比' : `无法获取改动对比：${json?.error || status}`,
+        );
+        return;
+      }
+      payload = json;
+    } catch (err) {
+      vscode.window.showWarningMessage(`无法获取改动对比：${String(err?.message || err)}`);
+      return;
+    }
+
+    const file = String(payload?.path || '');
+    const display = String(payload?.display || file);
+    // 二进制 / 文件过大 / 被拒绝：给明确提示，不假装能对比。
+    if (payload?.kind !== 'text') {
+      const reason = payload?.kind === 'binary'
+        ? '二进制文件，无法预览差异'
+        : payload?.kind === 'oversized' ? '文件过大，无法预览差异' : '该文件不支持差异预览';
+      vscode.window.showInformationMessage(`${display}：${reason}`);
+      return;
+    }
+
+    const folder = this.baseDirFor(sessionId);
+    const abs = path.isAbsolute(file) ? file : path.join(folder, file);
+
+    // 新文件（before=false）：左侧为空文档。其余情况反推改动前内容。
+    const afterExists = payload?.after !== false;
+    const beforeExists = payload?.before !== false;
+    // after 侧直接用磁盘原文，避免「切行再拼回」丢掉末尾换行。
+    // 切行必须与 DSH 同口径（保留 CRLF 的 \r），否则 hunks 对不上磁盘。
+    let afterText = '';
+    let afterLines = [];
+    if (afterExists) {
+      try {
+        afterText = fs.readFileSync(abs, 'utf8');
+      } catch {
+        vscode.window.showWarningMessage(`无法读取 ${display} 的当前内容`);
+        return;
+      }
+      afterLines = sessionView.splitLines(afterText);
+    }
+    // 该轮之后文件若又被改过，hunks 与磁盘内容对不上：
+    // 此时左（hunks 反推）右（磁盘）不是同一时刻的两个版本，
+    // 硬拼会展示一份把「本轮改动」和「后续改动」混在一起的假 diff。
+    if (beforeExists && !sessionView.hunksMatchContent(afterLines, payload?.hunks)) {
+      vscode.window.showWarningMessage(
+        `${display} 在该轮之后又被修改过，无法精确对比本轮改动`,
+      );
+      return;
+    }
+
+    // before 侧由 hunks 反推；末尾换行跟随 after（同一文件通常不变）。
+    const beforeLines = beforeExists
+      ? sessionView.invertHunks(afterLines, payload?.hunks)
+      : [];
+    const beforeText = beforeExists
+      ? beforeLines.join('\n') + (afterText.endsWith('\n') ? '\n' : '')
+      : '';
+
+    // key 用单调序号：同一毫秒内连点两次也不会互相覆盖（时间戳会）。
+    diffDocSeq += 1;
+    const stamp = `${diffDocSeq}-${index}`;
+    const beforeKey = `/before/${stamp}`;
+    const afterKey = `/after/${stamp}`;
+    rememberDiffDoc(beforeKey, beforeText);
+    rememberDiffDoc(afterKey, afterText);
+
+    const title = `${display}（DSH 改动）`;
+    const left = vscode.Uri.from({ scheme: DIFF_SCHEME, path: beforeKey, query: title });
+    const right = vscode.Uri.from({ scheme: DIFF_SCHEME, path: afterKey, query: title });
+    try {
+      await vscode.commands.executeCommand('vscode.diff', left, right, title);
+    } catch (err) {
+      // vscode.diff 缺席或差异编辑器拒绝打开时，不能让它变成未处理的
+      // Promise 拒绝（onMessage 是 void 调用）：否则用户点了一下、什么也没发生。
+      vscode.window.showWarningMessage(`无法打开对比：${String(err?.message || err)}`);
+    }
+  }
+
+  /**
+   * 改动卡片该挂到哪条助手消息。
+   *
+   * 为什么不能直接用 ensureAssistant()：`workspace/changes` 可能晚于
+   * `turn/end` 到达（DSH 不保证顺序），而 turn/end 会把 streamingIndex 清成 -1。
+   * 此时 ensureAssistant() 会新开一条只有卡片的空气泡，并把 streamingIndex
+   * 指向它 —— 下一轮的正文于是被追进这条带旧卡片的空气泡，改动算错回合。
+   *
+   * 复用已有消息时**不修改 streamingIndex**，避免同样的串轮。
+   *
+   * @returns {number} 目标助手消息的下标
+   */
+  assistantIndexForChanges() {
+    if (this.streamingIndex >= 0) {
+      const current = this.messages[this.streamingIndex];
+      if (current && current.role === 'assistant') return this.streamingIndex;
+    }
+    for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+      if (this.messages[i]?.role === 'assistant') return i;
+    }
+    return this.ensureAssistant();
+  }
+
+  /**
+   * 收到 workspace/changes 后拉一次文件列表，挂到当前助手消息上。
+   *
+   * 为什么要单独拉：事件里只有 turn，没有文件；这是 DSH 的既定契约。
+   * 拉失败不打断对话（静默），因为改动卡片只是增强信息。
+   *
+   * @param {number} seq workspace/changes 事件的序列号
+   */
+  async attachChanges(seq) {
+    if (!this.sessionId || !Number.isSafeInteger(seq) || seq < 0) return;
+    // 固定「发起这次查询的会话」：await 期间用户可能切了会话（历史覆盖层
+    // 支持跨工作区切换），不固定的话会把上一条会话的改动卡片挂到新会话的
+    // 消息列表上——而且 seq 属于另一个会话，卡片内容也对不上。
+    const sessionId = this.sessionId;
+    let json;
+    try {
+      const res = await sessionView.fetchChanges(channel(), sessionId, seq);
+      if (res.status !== 200) return;
+      json = res.json;
+    } catch { return; }
+    if (this.sessionId !== sessionId) return;
+    const files = Array.isArray(json?.files) ? json.files : [];
+    if (files.length === 0) return;
+    const index = this.assistantIndexForChanges();
+    const msg = this.messages[index];
+    // 同一次改动只挂一张卡
+    if (msg.parts.some((p) => p.type === 'changes' && p.seq === seq)) return;
+    msg.parts.push({
+      type: 'changes',
+      seq,
+      turn: Number(json?.turn) || 0,
+      added: Number(json?.added) || 0,
+      deleted: Number(json?.deleted) || 0,
+      total: Number(json?.total) || files.length,
+      files: files.map((f) => ({
+        path: String(f?.path || ''),
+        display: String(f?.display || f?.path || ''),
+        added: Number(f?.added) || 0,
+        deleted: Number(f?.deleted) || 0,
+        binary: f?.binary === true,
+        oversized: f?.oversized === true,
+      })),
+    });
     this.postState();
   }
 
@@ -727,7 +1042,7 @@ function collect(includeSelection) {
   return { file: info.file, line: info.line, text };
 }
 
-/** 格式化要送进 Agents 输入框的文本。 */
+/** 把要送进 Agents 输入框的文本格式化：位置行 + 代码块。 */
 function formatPayload(file, line, text) {
   const loc = file ? `@${file}${line ? `:${line}` : ''}` : '';
   if (!text) return loc ? `请看一下 ${loc}` : '';
@@ -751,8 +1066,7 @@ function activate(context) {
     }
   };
 
-  /** 把选区连同「请解释/修改」的引子填进侧栏 Chat 输入框。 */
-  const askSelection = async () => {
+  /** 把选区连同「请解释/修改」的引子填进侧栏 Chat 输入框。 */  const askSelection = async () => {
     const info = collectContext();
     await vscode.commands.executeCommand('dshEditor.chat.focus');
     if (!info || !info.hasSelection) {
@@ -768,8 +1082,17 @@ function activate(context) {
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+    // 「改动前」内容只存在于 DSH 的改动记录里，磁盘上没有；
+    // 用虚拟文档承载，供 vscode.diff 作为左侧内容。
+    vscode.workspace.registerTextDocumentContentProvider(DIFF_SCHEME, diffContentProvider),
+    // diff 关闭后立刻释放对应文本，避免只是靠 DIFF_DOC_MAX 兜底。
+    vscode.workspace.onDidCloseTextDocument((doc) => {
+      const uri = doc?.uri;
+      if (uri && uri.scheme === DIFF_SCHEME) diffDocuments.delete(uri.path);
+    }),
     vscode.commands.registerCommand('dshEditorBridge.sendSelection', () => send(true)),
     vscode.commands.registerCommand('dshEditorBridge.sendFile', () => send(false)),
+    // 资源管理器 / 终端入口（P1-2）：把选中项作为 @路径 引用送给 Agents
     vscode.commands.registerCommand('dshEditorBridge.askSelection', () => { void askSelection(); }),
     vscode.commands.registerCommand('dshEditorBridge.newChat', () => {
       void provider.newChat();

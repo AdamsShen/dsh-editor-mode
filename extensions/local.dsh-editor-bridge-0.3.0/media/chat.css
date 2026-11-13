@@ -546,3 +546,41 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .history-row-snippet { color: var(--vscode-descriptionForeground); font-size: 11px; opacity: .85; }
+
+/* ---- 「本轮改动」卡片 ---- */
+.changes {
+  margin: 4px 0; border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.3));
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,.08));
+}
+.changes > summary {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px; cursor: pointer; font-size: 12px;
+}
+.changes-title { color: var(--vscode-foreground); font-weight: 500; }
+.changes-stat {
+  margin-left: auto; color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-editor-font-family, monospace); font-size: 11px;
+}
+.changes-list { padding: 0 4px 4px; }
+.changes-empty {
+  padding: 2px 6px; font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.changes-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  border: 0; background: transparent; text-align: left;
+  color: var(--vscode-foreground);
+  padding: 3px 6px; border-radius: 3px; cursor: pointer;
+  font-size: 12px;
+}
+.changes-row:hover { background: var(--vscode-list-hoverBackground); }
+.changes-file {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.changes-delta {
+  flex: none; font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px; color: var(--vscode-descriptionForeground);
+}

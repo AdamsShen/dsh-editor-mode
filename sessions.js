@@ -21,6 +21,8 @@
  *   POST /editor-sessions/rename                → { ok: true }
  *   GET  /editor-sessions/history?sessionId=&beforeSeq=  → 历史页（冷会话也能读）
  *   GET  /editor-sessions/stream?sessionId=     → SSE：snapshot / event / delta / state
+ *   GET  /editor-sessions/changes?sessionId=&seq=         → 本轮改动文件列表
+ *   GET  /editor-sessions/changes/diff?sessionId=&seq=&index=  → 单文件前后对比（hunks）
  *
  * 降级：sessionController 不可用时，所有端点返回 503 并说明原因，
  * 由扩展侧提示「DSH 未提供会话服务」，绝不静默失败。
@@ -60,6 +62,9 @@ const UI_EVENT_TYPES = new Set([
   'session/title',
   'approval/asked',
   'approval/decided',
+  // Agent 改完文件的汇总事件。data 只有一个 {turn}，文件列表要再按
+  // (sessionId, seq) 去 /editor-sessions/changes 取 —— 见下面 changes 端点。
+  'workspace/changes',
 ]);
 
 /** 单次请求体上限（prompt 可能带选区代码）。 */
@@ -335,6 +340,103 @@ export function registerSessionRoutes({ ctx, webServer, token, deps }) {
           hasMore: Boolean(result?.hasMore),
           events: toEvents(result),
         });
+      } catch (err) {
+        json(res, 500, { error: String(err?.message || err) });
+      }
+    },
+  }));
+
+  /**
+   * 读一个非负整数查询参数；缺失或非法一律返回 NaN。
+   *
+   * 为什么不能直接 `Number(url.searchParams.get(name))`：
+   * 参数缺失时 `get()` 返回 `null`，而 `Number(null) === 0`、`Number('') === 0`，
+   * 于是「没传」会被当成「传了 0」——校验被绕过。对 `index` 尤其危险：
+   * 缺参会静默返回第 0 个文件的对比，用户拿到的是**另一个文件**。
+   * （`history` 的 beforeSeq 踩过同一个坑。）
+   *
+   * @param {URL} url
+   * @param {string} name
+   * @returns {number} 合法非负整数，否则 NaN
+   */
+  const nonNegativeInt = (url, name) => {
+    const raw = url.searchParams.get(name);
+    if (raw === null || raw === '') return NaN;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) && value >= 0 ? value : NaN;
+  };
+
+  // ---- Agent 改动：文件列表 + 单文件前后对比 ----
+  //
+  // 为什么不用 rewind 快照：实测（2026-11）`dsh-rewind-plugin` 只导出
+  // Config/SnapshotStore/apply 等，未注册任何可供外部插件调用的服务，
+  // 对外只有两个面向 Client UI 的路由。真正能读的是 DSH 自己的
+  // `workspaceChanges` 服务（由 dsh-web-app 组成，与 sessionController 同级）：
+  //   summary(sessionId, seq)          → { turn, files[], total, added, deleted }
+  //   diff(sessionId, seq, index, sig) → { kind, path, display, before, after, hunks, coarse }
+  //
+  // 注意 `seq` 是 workspace/changes 事件的序列号（该事件的 data 只有 {turn}，
+  // 文件列表不在事件里），所以前端必须先拿到事件再回来查。
+  const changes = () => ctx.get('workspaceChanges');
+
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: `${SESSIONS_PREFIX}/changes`,
+    handler: async (req, res) => {
+      if (guard(req, res, 'GET')) return;
+      const url = new URL(req.url, 'http://localhost');
+      if (tokenFromRequest(req, url) !== token) { json(res, 401, { error: 'unauthorized' }); return; }
+      const sessionId = String(url.searchParams.get('sessionId') || '');
+      const seq = nonNegativeInt(url, 'seq');
+      if (!sessionId) { json(res, 400, { error: 'sessionId 必填' }); return; }
+      if (!Number.isSafeInteger(seq)) { json(res, 400, { error: 'seq 必填且需为非负整数' }); return; }
+
+      const svc = changes();
+      if (!svc?.summary) { json(res, 503, { error: 'DSH 未提供改动记录服务' }); return; }
+      try {
+        const summary = svc.summary(sessionId, seq);
+        if (summary === undefined) {
+          // 记录只在 recorder 存活期间有效（重启 / 会话被回收后就没有了）。
+          // 明确区分「没有改动」与「记录已过期」，前端才能给对提示。
+          json(res, 404, { error: '该会话的改动记录已过期' });
+          return;
+        }
+        const { turn, files, total, added, deleted } = summary;
+        json(res, 200, {
+          turn,
+          total,
+          added,
+          deleted,
+          files: Array.isArray(files) ? files : [],
+        });
+      } catch (err) {
+        json(res, 500, { error: String(err?.message || err) });
+      }
+    },
+  }));
+
+  disposers.push(webServer.register({
+    kind: 'exact',
+    path: `${SESSIONS_PREFIX}/changes/diff`,
+    handler: async (req, res) => {
+      if (guard(req, res, 'GET')) return;
+      const url = new URL(req.url, 'http://localhost');
+      if (tokenFromRequest(req, url) !== token) { json(res, 401, { error: 'unauthorized' }); return; }
+      const sessionId = String(url.searchParams.get('sessionId') || '');
+      const seq = nonNegativeInt(url, 'seq');
+      const index = nonNegativeInt(url, 'index');
+      if (!sessionId) { json(res, 400, { error: 'sessionId 必填' }); return; }
+      if (!Number.isSafeInteger(seq)) { json(res, 400, { error: 'seq 必填且需为非负整数' }); return; }
+      if (!Number.isSafeInteger(index)) { json(res, 400, { error: 'index 必填且需为非负整数' }); return; }
+
+      const svc = changes();
+      if (!svc?.diff) { json(res, 503, { error: 'DSH 未提供改动对比服务' }); return; }
+      try {
+        const ac = new AbortController();
+        req.on('close', () => ac.abort());
+        const diff = await svc.diff(sessionId, seq, index, ac.signal);
+        if (diff === undefined) { json(res, 404, { error: '该改动记录已过期' }); return; }
+        json(res, 200, diff);
       } catch (err) {
         json(res, 500, { error: String(err?.message || err) });
       }

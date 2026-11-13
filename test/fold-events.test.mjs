@@ -8,7 +8,7 @@
  */
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { foldEvents, summarizeToolResult, formatArgs } = require('../extensions/local.dsh-editor-bridge-0.3.0/session-view.js');
+const { foldEvents, summarizeToolResult, formatArgs, invertHunks, hunksMatchContent, splitLines } = require('../extensions/local.dsh-editor-bridge-0.3.0/session-view.js');
 
 let failed = 0;
 function check(name, condition, detail) {
@@ -119,6 +119,115 @@ console.log('辅助函数');
   check('短结果原样返回', summarizeToolResult('ok') === 'ok');
   check('参数对象序列化', formatArgs({ a: 1 }).includes('"a":1'));
   check('超长参数截断', formatArgs({ s: 'y'.repeat(600) }).endsWith('…'));
+}
+
+console.log('Agent 改动卡片');
+{
+  const msgs = foldEvents([
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '改一下' }] } },
+    { type: 'tool/call', data: { callId: 'c1', toolName: 'write', arguments: '{}' } },
+    { type: 'workspace/changes', seq: 27, data: { turn: 1 } },
+    { type: 'turn/end', data: { turn: 1 } },
+  ]);
+  const parts = msgs.flatMap((m) => m.parts || []);
+  const card = parts.find((p) => p.type === 'changes');
+  check('折叠出 changes 卡片', Boolean(card));
+  check('卡片带 seq', card.seq === 27, String(card?.seq));
+  check('卡片带 turn', card.turn === 1, String(card?.turn));
+  check('卡片初始 pending（列表待补全）', card.pending === true);
+  check('卡片初始 files 为空数组', Array.isArray(card.files) && card.files.length === 0);
+
+  // 同一 seq 只折叠一张卡（历史里重复出现时不重复渲染）
+  const dup = foldEvents([
+    { type: 'workspace/changes', seq: 27, data: { turn: 1 } },
+    { type: 'workspace/changes', seq: 27, data: { turn: 1 } },
+  ]);
+  check('同 seq 不重复出卡', dup.flatMap((m) => m.parts).filter((p) => p.type === 'changes').length === 1);
+
+  // 非法 seq 直接跳过，不产出坏卡
+  const bad = foldEvents([{ type: 'workspace/changes', data: { turn: 1 } }]);
+  check('缺 seq 不出卡', bad.flatMap((m) => m.parts || []).every((p) => p.type !== 'changes'));
+}
+
+console.log('改动卡片的回合归属（事件顺序可能晚于 turn/end）');
+{
+  const U = (t) => ({ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: t }] } });
+  const A = (t) => ({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: t }] } } });
+  const C = (seq) => ({ type: 'workspace/changes', seq, data: { turn: 1 } });
+  const TE = { type: 'turn/end', data: { turn: 1 } };
+  const cardOf = (msgs) => msgs.flatMap((m) => m.parts || []).find((p) => p.type === 'changes');
+
+  // A) 正常顺序：卡片与工具/正文同一条助手消息
+  const a = foldEvents([U('改文件'), A('改好了'), C(33), TE]);
+  check('正常顺序：卡片与助手正文同一条', a.length === 2 && a[1].parts.some((p) => p.type === 'changes'));
+
+  // B) 晚于 turn/end：不能多出一条只有卡片的空气泡
+  const b = foldEvents([U('改文件'), A('改好了'), TE, C(33)]);
+  check('晚于 turn/end 不产生空气泡', b.length === 2, JSON.stringify(b.map((m) => m.role)));
+  check('晚于 turn/end 仍挂在原助手消息上',
+    Boolean(b[1] && b[1].parts.some((p) => p.type === 'changes' && p.seq === 33)));
+
+  // C) 晚到且下一轮用户消息已到：不能把上一次改动算到新一轮头上
+  const c = foldEvents([U('改文件'), A('改好了'), TE, U('再改一次'), C(33)]);
+  check('不挂到下一轮用户消息之后', c.length === 3, JSON.stringify(c.map((m) => m.role)));
+  check('仍归属上一轮助手消息',
+    Boolean(c[1] && c[1].parts.some((p) => p.type === 'changes' && p.seq === 33)));
+  check('最后一轮助手消息不含该卡片',
+    !(c[2] && c[2].parts.some((p) => p.type === 'changes')));
+
+  // D) 整段没有助手消息：自建占位，且不接管后续文字
+  const d = foldEvents([U('改文件'), C(34), A('后续回复')]);
+  check('无助手消息时自建占位', Boolean(cardOf(d)));
+  check('自建占位不吞掉后续正文',
+    d.some((m) => m.parts.some((p) => p.type === 'text' && p.text === '后续回复')));
+}
+
+console.log('改动前后反推（invertHunks）');
+{
+  check('改一行', JSON.stringify(invertHunks(['l1', 'XYZ', 'l3'],
+    [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' l1', '-abc', '+XYZ', ' l3'] }])) === '["l1","abc","l3"]');
+  check('纯新增', JSON.stringify(invertHunks(['a', 'NEW', 'b'],
+    [{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 3, lines: [' a', '+NEW', ' b'] }])) === '["a","b"]');
+  check('纯删除', JSON.stringify(invertHunks(['a', 'c'],
+    [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 2, lines: [' a', '-b', ' c'] }])) === '["a","b","c"]');
+  check('coarse 整文件', JSON.stringify(invertHunks(['x', 'y'],
+    [{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 2, lines: ['-a', '-b', '+x', '+y'] }])) === '["a","b"]');
+  check('多 hunk 倒序不串位', JSON.stringify(invertHunks(['1', 'X', '3', '4', 'Y', '6'], [
+    { oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' 1', '-2', '+X', ' 3'] },
+    { oldStart: 4, oldLines: 3, newStart: 4, newLines: 3, lines: [' 4', '-5', '+Y', ' 6'] },
+  ])) === '["1","2","3","4","5","6"]');
+  check('空 hunks 原样', JSON.stringify(invertHunks(['a'], [])) === '["a"]');
+  check('hunks 非数组不崩', JSON.stringify(invertHunks(['a'], null)) === '["a"]');
+}
+
+console.log('hunks 与磁盘内容一致性（防止误标本轮改动）');
+{
+  const hunks = [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' line1', '-line2', '+changed-line', ' line3'] }];
+  check('真实一致时通过', hunksMatchContent(['line1', 'changed-line', 'line3', ''], hunks) === true);
+  // 该轮之后又被改过 → 必须识别出来，否则左右两栏不是同一时刻的版本
+  check('磁盘漂移时拒绝', hunksMatchContent(['line1', 'NEWER-EDIT', 'line3', ''], hunks) === false);
+  check('空 hunks 视为一致', hunksMatchContent(['x'], []) === true);
+  check('hunks 为 null 不崩', hunksMatchContent(['x'], null) === true);
+  check('newStart 非法视为不一致', hunksMatchContent(['x'], [{ newStart: 0, newLines: 1, lines: [' x'] }]) === false);
+  check('行数不符视为不一致', hunksMatchContent(['x'], [{ newStart: 1, newLines: 5, lines: [' x'] }]) === false);
+}
+
+console.log('切行口径与 DSH 一致（CRLF 不能误判）');
+{
+  // DSH 的 lines() 等价实现：先补 \n，再 slice(0,-1).split("\n")
+  const dshLines = (t) => (t === '' ? [] : (t.endsWith('\n') ? t : `${t}\n`).slice(0, -1).split('\n'));
+  for (const text of ['', '\n', 'a', 'a\n', 'a\nb', 'a\nb\n', 'a\r\nb\r\n', 'a\r\nb', 'x\r\n', '\r\n']) {
+    check(`切行等价 ${JSON.stringify(text)}`,
+      JSON.stringify(splitLines(text)) === JSON.stringify(dshLines(text)),
+      `${JSON.stringify(splitLines(text))} vs ${JSON.stringify(dshLines(text))}`);
+  }
+
+  // CRLF 文件必须能正常校验与反推（修复前会被一律拒绝）
+  const crlfAfter = splitLines('a\r\nB\r\nc\r\n');
+  const crlfHunks = [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' a\r', '-b\r', '+B\r', ' c\r'] }];
+  check('CRLF 校验通过', hunksMatchContent(crlfAfter, crlfHunks) === true);
+  check('CRLF 反推正确', JSON.stringify(invertHunks(crlfAfter, crlfHunks)) === JSON.stringify(['a\r', 'b\r', 'c\r']));
+  check('CRLF 保留 \\r', invertHunks(crlfAfter, crlfHunks).join('\n').includes('\r'));
 }
 
 console.log(failed === 0 ? 'PASS: 折叠规则自洽' : `FAIL: ${failed} 项失败`);

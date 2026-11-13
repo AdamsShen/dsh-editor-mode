@@ -16,6 +16,7 @@ const EXT = join(HERE, '..', 'extensions', 'local.dsh-editor-bridge-0.3.0');
 const html = readFileSync(join(EXT, 'media', 'chat.html'), 'utf8');
 const extensionSrc = readFileSync(join(EXT, 'extension.js'), 'utf8');
 const chatSrc = readFileSync(join(EXT, 'media', 'chat.js'), 'utf8');
+const cssSrc = readFileSync(join(EXT, 'media', 'chat.css'), 'utf8');
 const manifest = JSON.parse(readFileSync(join(EXT, 'package.json'), 'utf8'));
 
 let failed = 0;
@@ -94,7 +95,7 @@ const handled = [...new Set([...extensionSrc.matchAll(/case '([a-zA-Z]+)':/g)].m
 //   - 会话切换/重命名；历史覆盖层用 listSessions(all) / searchSessions / openSession
 //   - 模型选择与上下文开关并入会话本身；escalate 删除（Chat 本身就是 Agent）
 for (const type of ['ready', 'send', 'stop', 'newChat', 'selectSession', 'renameSession', 'openFile',
-  'listSessions', 'searchSessions', 'openSession']) {
+  'listSessions', 'searchSessions', 'openSession', 'openChangeDiff']) {
   check(`webview 发出 ${type}，扩展有处理`, posted.includes(type) && handled.includes(type));
 }
 for (const type of ['state', 'append', 'reasoning', 'prefill', 'contextInfo', 'sessions', 'allSessions']) {
@@ -117,6 +118,31 @@ check('已从 manifest 移除常驻历史视图',
   !JSON.stringify(manifest.contributes.views).includes('dshEditor.history'));
 
 console.log('不会泄露 token 到 webview');
+// P0-1：AI 改动 diff 审核
+check('扩展注册了改动虚拟文档 provider',
+  extensionSrc.includes('registerTextDocumentContentProvider') && extensionSrc.includes("DIFF_SCHEME"));
+check('扩展用原生 vscode.diff 打开对比', extensionSrc.includes("'vscode.diff'"));
+check('改动事件已接入扩展', extensionSrc.includes("type === 'workspace/changes'"));
+check('扩展会拉改动列表', extensionSrc.includes('fetchChanges'));
+check('扩展会拉单文件对比', extensionSrc.includes('fetchChangeDiff'));
+check('历史折叠也会产出改动卡片', extensionSrc.includes('fillPendingChanges'));
+check('webview 渲染改动卡片', chatSrc.includes('changesNode'));
+check('改动卡片样式存在', cssSrc.includes('.changes-row'));
+// 虚拟文档必须回收，否则长会话里累积整文件文本
+check('虚拟文档有上限且会淘汰', extensionSrc.includes('DIFF_DOC_MAX') && extensionSrc.includes('rememberDiffDoc'));
+check('文档关闭时释放', extensionSrc.includes('onDidCloseTextDocument'));
+// 相对路径必须按「会话 cwd」解析，不能一律用当前工作区
+check('相对路径按会话 cwd 解析', extensionSrc.includes('baseDirFor'));
+check('key 用单调序号而非时间戳', extensionSrc.includes('diffDocSeq += 1'));
+// 切行口径必须与 DSH 一致，否则 CRLF 文件会被一致性校验一律拒绝
+check('切行走 splitLines 而非正则', extensionSrc.includes('sessionView.splitLines')
+  && !/readFileSync\([^)]*\)\.split\(\/\\r\?/.test(extensionSrc));
+check('after 侧用磁盘原文（不丢失末尾换行）', extensionSrc.includes('let afterText'));
+// 并发加载：旧响应不得覆盖新列表（切 tab 快时会撞）
+check('history 加载有代号守卫', extensionSrc.includes('historyGen')
+  && extensionSrc.includes('me !== this.historyGen'));
+check('过期加载结果被丢弃', /if \(me !== this\.historyGen\) return;/.test(extensionSrc));
+
 check('扩展没有把 token 放进 post 的消息',
   !/post\(\{[^}]*token/.test(extensionSrc),
   'token 只应在 Node 侧使用');

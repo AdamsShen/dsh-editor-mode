@@ -99,6 +99,79 @@
   // ---------------------------------------------------------------- 渲染
 
   /** 工具调用卡片：一行摘要，点开看参数与结果。 */
+  /**
+   * 「本轮改动」卡片。
+   *
+   * 数据来自 DSH 的 workspaceChanges：一条汇总（N 个文件 +X −Y）加每文件的
+   * 增删行数。点击某个文件由扩展侧拉 hunks 并用原生 vscode.diff 打开，
+   * webview 不自己渲染差异文本。
+   */
+  function changesNode(part) {
+    const details = document.createElement('details');
+    details.className = 'changes';
+    details.open = true;
+
+    const summary = document.createElement('summary');
+    const title = document.createElement('span');
+    title.className = 'changes-title';
+    const count = Number(part.total) || (part.files || []).length;
+    title.textContent = `本轮改动 ${count} 个文件`;
+    summary.appendChild(title);
+
+    const stat = document.createElement('span');
+    stat.className = 'changes-stat';
+    stat.textContent = `+${Number(part.added) || 0} −${Number(part.deleted) || 0}`;
+    summary.appendChild(stat);
+    details.appendChild(summary);
+
+    const list = document.createElement('div');
+    list.className = 'changes-list';
+
+    if (part.pending) {
+      const hint = document.createElement('div');
+      hint.className = 'changes-empty';
+      hint.textContent = '正在读取改动…';
+      list.appendChild(hint);
+    } else if (!(part.files || []).length) {
+      const hint = document.createElement('div');
+      hint.className = 'changes-empty';
+      // 按真实原因给文案：把「服务不存在」说成「记录过期」会误导排查。
+      const reason = part.emptyReason;
+      hint.textContent = reason === 'unavailable' ? 'DSH 未提供改动记录服务'
+        : reason === 'failed' ? '读取改动记录失败'
+        : reason === 'none' ? '本次没有文件改动'
+        // 缺省（含历史遗留的 pending=false）仍按最可能的过期处理
+        : '改动记录已过期，无法列出文件';
+      list.appendChild(hint);
+    } else {
+      for (let i = 0; i < part.files.length; i += 1) {
+        // 单个文件项异常不应炸掉整条日志的渲染，兜底成空对象。
+        const file = part.files[i] || {};
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'changes-row';
+        row.dataset.seq = String(part.seq);
+        row.dataset.index = String(i);
+        row.dataset.act = 'openChangeDiff';
+
+        const name = document.createElement('span');
+        name.className = 'changes-file';
+        name.textContent = file.display || file.path;
+        row.appendChild(name);
+
+        const delta = document.createElement('span');
+        delta.className = 'changes-delta';
+        delta.textContent = file.binary || file.oversized
+          ? (file.binary ? '二进制' : '过大')
+          : `+${file.added} −${file.deleted}`;
+        row.appendChild(delta);
+        list.appendChild(row);
+      }
+    }
+    details.appendChild(list);
+    return details;
+  }
+
   function toolNode(part) {
     const details = document.createElement('details');
     details.className = 'tool';
@@ -160,6 +233,10 @@
     for (const part of message.parts || []) {
       if (part.type === 'tool') {
         el.appendChild(toolNode(part));
+        continue;
+      }
+      if (part.type === 'changes') {
+        el.appendChild(changesNode(part));
         continue;
       }
       if (part.type !== 'text' || !String(part.text || '').trim()) continue;
@@ -478,6 +555,16 @@
     if (btn.dataset.act === 'copy') {
       const message = state.messages[Number(btn.dataset.index)];
       if (message) void navigator.clipboard.writeText(textOf(message));
+      return;
+    }
+    if (btn.dataset.act === 'openChangeDiff') {
+      // 差异由扩展侧拉 hunks 后交给原生 vscode.diff；webview 不渲染 diff 文本。
+      vscode.postMessage({
+        type: 'openChangeDiff',
+        sessionId: state.sessionId,
+        seq: Number(btn.dataset.seq),
+        index: Number(btn.dataset.index),
+      });
     }
   });
 
