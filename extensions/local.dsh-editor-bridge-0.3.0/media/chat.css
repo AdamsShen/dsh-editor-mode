@@ -584,3 +584,15 @@ body {
   flex: none; font-family: var(--vscode-editor-font-family, monospace);
   font-size: 11px; color: var(--vscode-descriptionForeground);
 }
+
+/* MCP 工具来源标识：让用户一眼看出工具来自外部服务 */
+.tool-mcp {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  opacity: 0.75;
+  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+  color: var(--vscode-badge-foreground, inherit);
+  white-space: nowrap;
+}

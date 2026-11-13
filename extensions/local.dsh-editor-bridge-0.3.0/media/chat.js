@@ -183,6 +183,20 @@
     name.textContent = part.name || '工具';
     summary.appendChild(name);
 
+    // MCP 工具：标出它来自哪个外部服务。用户看到陌生工具名时，
+    // 至少要能判断数据是不是被发给了外部系统。
+    // mcpServer 为空串表示「是 MCP 工具但服务名没能解析出来」（名字被截断）：
+    // 仍要标出来，不能静默当成普通工具。
+    if (typeof part.mcpServer === 'string') {
+      const tag = document.createElement('span');
+      tag.className = 'tool-mcp';
+      tag.textContent = part.mcpServer ? `MCP · ${part.mcpServer}` : 'MCP';
+      tag.title = part.mcpServer
+        ? `来自 MCP 服务 ${part.mcpServer}（原始工具名 ${part.mcpTool || part.name}）`
+        : '来自 MCP 服务（服务名未能解析，工具名可能被截断）';
+      summary.appendChild(tag);
+    }
+
     if (part.summary) {
       const arg = document.createElement('span');
       arg.className = 'tool-arg';
@@ -531,7 +545,56 @@
     }, 250);
   });
 
-  inputEl.addEventListener('input', autoGrow);
+  // ---------------------------------------------------------------- `@` 引用
+  // 这是 `@` 引用的**唯一实现**（扩展侧不需要它，故没有副本可漂移）。
+  // 规则：只认「前面是开头或空白的 @」，token 不含空白与引号等分隔符。
+  // `test/refs.test.mjs` 直接从这里抽取被测代码，测的就是线上跑的那份。
+  const REF_CHAR = /[^\s@'"`()\[\]{}<>，。；：、]/;
+
+  function refTokenAt(value, cursor) {
+    const text = String(value ?? '');
+    const pos = Number.isInteger(cursor) ? Math.max(0, Math.min(cursor, text.length)) : text.length;
+    let i = pos - 1;
+    while (i >= 0 && text[i] !== '@' && REF_CHAR.test(text[i])) i -= 1;
+    if (i < 0 || text[i] !== '@') return null;
+    const before = i - 1;
+    if (before >= 0 && !/\s/.test(text[before])) return null;
+    let end = pos;
+    while (end < text.length && REF_CHAR.test(text[end])) end += 1;
+    return { start: i, end, query: text.slice(i + 1, pos) };
+  }
+
+  function applyRef(value, cursor, ref) {
+    const text = String(value ?? '');
+    const pos = Number.isInteger(cursor) ? Math.max(0, Math.min(cursor, text.length)) : text.length;
+    const name = String(ref ?? '').replace(/^@/, '').trim();
+    const rendered = /\s/.test(name) ? `@"${name}"` : `@${name}`;
+    const token = refTokenAt(text, pos);
+    if (!token) {
+      const head = text.slice(0, pos);
+      const tail = text.slice(pos);
+      const glue = head && !/\s$/.test(head) ? ' ' : '';
+      const inserted = `${glue}${rendered} `;
+      return { value: `${head}${inserted}${tail}`, cursor: pos + inserted.length };
+    }
+    const head = text.slice(0, token.start);
+    const tail = text.slice(token.end);
+    const inserted = `${rendered} `;
+    return { value: `${head}${inserted}${tail}`, cursor: head.length + inserted.length };
+  }
+
+  /** 输入 `@` 后请求扩展弹选择器（带防抖，避免每敲一个字符弹一次）。 */
+  let refTimer = 0;
+  function maybePickRef() {
+    const token = refTokenAt(inputEl.value, inputEl.selectionStart);
+    if (!token) return;
+    clearTimeout(refTimer);
+    refTimer = window.setTimeout(() => {
+      post({ type: 'pickRef', query: token.query });
+    }, 120);
+  }
+
+  inputEl.addEventListener('input', () => { autoGrow(); maybePickRef(); });
   inputEl.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
@@ -626,6 +689,15 @@
         state.hasEditor = Boolean(msg.hasEditor);
         renderStatus();
         break;
+      case 'insertRef': {
+        const applied = applyRef(inputEl.value, inputEl.selectionStart, String(msg.ref || ''));
+        inputEl.value = applied.value;
+        inputEl.selectionStart = applied.cursor;
+        inputEl.selectionEnd = applied.cursor;
+        autoGrow();
+        inputEl.focus();
+        break;
+      }
       case 'prefill':
         inputEl.value = String(msg.text || '');
         autoGrow();
