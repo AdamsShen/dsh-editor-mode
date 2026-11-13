@@ -23,13 +23,30 @@
 
 ---
 
+> **执行机制调整（2026-11-13）**：`.autopilot/config.yml` 的 `review.scope` 由
+> `project` 改为 `executing_only`、`confirm_rounds` 由 5 改为 1。
+> 原因：`project` 模式下「自审 → 顺手再改一行 → 再次自审」会形成闭环，实际执行时
+> 十几轮都推进不了一项。改为只在执行清单项时自审一次。
+> 质量兜底不变：每项自带离线测试 + 变异验证 + 全量回归（当前 18 个用例）。
+
 ## B 高频体验（P1）
 
-- [ ] **P1-1 `@` 引用（文件 / 文件夹 / 符号）** · 2–3 人日 · 来源 S1
-    - Paths: `media/chat.js`、`extension.js`、`package.json`
-    - Done when: 输入框输入 `@` 触发 `showQuickPick` / `workspace.findFiles` 选文件，选中内容按预算截断后并入会话上下文
-    - Verify: 引用一个未打开的文件提问，Agent 能读到其内容；预算上限不被突破
-    - Depends on: 无
+- [x] **P1-1 `@` 引用（文件 / 文件夹 / 符号）** · 2–3 人日 · 来源 S1
+    - Paths: `extension.js`（QuickPick）、`media/chat.js`（token 识别/插入/触发）
+    - **订正**：曾抽出 `refs.js` 给扩展侧复用，但扩展实际用不到，且它是 ESM——
+      在旧 Node 扩展宿主上 require 会 `ERR_REQUIRE_ESM`。结果变成「只为测试存在的
+      死代码 + 两份会漂移的实现」。已删除，纯逻辑只保留 chat.js 一处，
+      `test/refs.test.mjs` 直接从 chat.js 抽取被测代码。
+    - Done when: 输入 `@` 触发选择器，列出**文件 / 目录 / 符号**三类，选中后插入 `@引用`
+    - 实现要点:
+      - 文件走 `workspace.findFiles`（排除 node_modules/dist 等），目录从文件路径反推
+        （省掉一遍递归读盘），符号走 `vscode.executeWorkspaceSymbolProvider`
+      - 符号插入成 `@file:line` —— 与正文里的跳转链接同一套语法，Agent 也认
+      - 路径含空格时自动加引号 `@"a b.md"`，否则 token 边界会破
+      - 只送**引用**不送文件内容：Chat 是真实 Agent，自己会读；避免撑爆上下文预算
+    - Verify: `test/refs.test.mjs`（从线上代码抽取，不是副本）+ `test/ref-picker.test.mjs`
+      （用假 vscode 真跑选择器：过滤/目录反推/符号 file:line/取消/空结果）
+    - Note: 抗抖 120ms，避免每敲一个字符弹一次选择器
 
 - [x] **P1-2 更多上下文入口（资源管理器 / 终端右键）** · 0.5–1 人日 · 来源 S1
     - Paths: `package.json`（commands/menus/activationEvents）、`extension.js`
@@ -80,30 +97,76 @@
     - 关键判断：**「目录不存在 / 二进制不可执行」是运行时状态，不是配置错误**——
       判成致命错误会让「运行时未安装 → 给安装指引」这条正常路径变成启动崩溃
       （`host-restart.test.mjs` 当时就是这么暴露的）。这类只告警。
-    - Paths: `index.js`（`CONFIG_SPEC` / `validateConfig` / `apply` / `/editor-status`）
+    - Paths: `index.js`（`CONFIG_SPEC` / `validateConfig` / `apply`）
+    - **订正（2026-11-13）**：原计划写「`/editor-status` 返回 failed + 原因」，实测不成立——
+      配置非法时 `apply()` 在**注册任何路由之前**就抛错，`/editor-status` 根本不存在。
+      配置错误的可见渠道是插件激活失败 + DSH 日志里的 `editor-mode: 配置有 N 处问题…`。
+      `apply.lastConfigError` 只留作日志/测试的面包屑。
     - Done when: 用 schemastery / z 声明 `runtimeDir` / `upstreamHost` / `upstreamPort` / `nodeBin` / `workspaceDir` / `skipBuiltinExtensions` / `bridgeToken` 的类型与取值约束；非法配置在启动时给出明确错误而不是白屏
-    - Verify: 传一个越界端口与非法 `nodeBin`，插件报出可读错误且 `/editor-status` 显示 `failed`；`npm test` 全绿
+    - Verify: `test/config-validation.test.mjs` —— 越界端口/非法路径/非法扩展 id 均报可读错误，且一次列全；全量用例绿
     - Depends on: 建议排在 P3-1 之前
 
 ---
 
 ## D 产品化（P3）
 
-- [ ] **P3-1 运行时自动下载与校验（装完即用）** · 8–13 人日 · 来源 S2、S5
+- [x] **P3-1 运行时自动下载与校验（装完即用）** · 8–13 人日 · 来源 S2、S5
+    - **本轮交付核心链路**（安全边界已闭合，尚未覆盖跨平台 node 兼容与签名）：
+      - `planRuntime()` 纯决策：已存在→ready；缺来源或**缺校验和**→missing；都齐→install
+      - `ensureRuntime()`：下载 → **强制 SHA-256 校验** → 解包 → 同目录 rename 原子落位
+      - 安全底线：只接受 https（配置层校验）；**校验不过一个字节都不落位**；
+        下载限 200MB + 5 分钟超时；失败清理临时目录（安装包 200MB，不清理会堆积）
+      - 失败一律返回可读原因，`startServer` 转成可操作提示而不是白屏
+    - 附带修复：运行时缺失的「不可重试」判定原来靠正则匹配文案 `/未安装/`，
+      改文案就失效。改为抛错时打 `err.retryable = false` 显式标记，正则只作兜底。
+    - Verify: `test/runtime-bootstrap.test.mjs` —— 校验失败不落位、缺校验和不下载、
+      结构不符不落位、失败清临时目录、已有安装不重复下载（IO 全注入，离线）
+    - 未做（留给后续）：跨平台 node 兼容、hardened runtime 签名、断网重试退避
     - Paths: `index.js`（新 `ensureRuntime`）、`package.json`、`cordis.patch.yml`
     - Done when: 插件首次启动自动下载 code-server 指定版本并校验 SHA-256，落到插件自管目录；不再要求用户手动 `npm install code-server`
     - Verify: 删掉 `~/.dsh/editor-runtime/node_modules/code-server` 后重启 DSH，插件自动补齐并拉起工作台；断网时给出可操作提示而非白屏
     - Depends on: P2-4（schema）、跨平台 Node 兼容与 hardened runtime 签名
     - Note: **「装完即用」的唯一硬门槛**，也是 S2「无 Config schema、无运行时自动下载」的完整修复
 
-- [ ] **P3-2 同源反代** · 5–8 人日 · 来源 S2
+- [ ] **P3-2 同源反代** · 5–8 人日 · 来源 S2 —— **部分验证完成：DSH 侧机制已确认，关键事实未测 → 暂不实现**
+    - **已核实的事实（2026-11-13）**，证据来自 DSH 与 code-server 源码：
+      1. `dsh-host-webserver/lib/index.js:523` —— `route = this.upgrades.get(pathname)`，
+         **精确匹配**；未命中直接 `socket.destroy()`，没有前缀匹配（fallback 见第 4 条）。
+      2. 因此我们只能注册 `/editor/` 这一个**确切**路径的 upgrade。
+      3. code-server 侧的 WS 路由是 `/`、`/proxy/:port/*`、`/absproxy/:port/*`
+         （`out/node/routes/*.js`），其中 VS Code 的 socket 用 `wsRouter.ws(/.*/)`
+         接**任意路径** —— 服务端宽容。
+      4. `fallback` 的消费点是 `index.js:577`（`match(pathname) ?? this.fallback`），
+         属 HTTP 路径；upgrade 分支里完全没有 fallback —— 已逐行确认。
+    - **所以：是否构成障碍，完全取决于一个尚未实测的事实** ——浏览器端连接的**确切
+      pathname**。若等于 `/editor/`，现有那条路由就够用（此时 P3-2 主要工作只剩
+      关掉 `--trusted-origins '*'` 并验证）；若带后缀则必然 404。
+      这一步不能靠推断（前端 bundle 已混淆），必须实测抓包。
+    - 下次动手的验证步骤：启动 DSH + 编辑器，用一次性 TCP 日志代理横在 iframe 与
+      code-server 之间，记录所有 upgrade 的 `req.url`；据此判断要注册哪几个确切路径。
+    - 保留现状：iframe 直连回环（已可用），不引入半成品反代。
     - Paths: `index.js`（`registerUpgrade` / `proxyUpgrade`）
     - Done when: code-server 的多条动态 WebSocket 路径能通过 DSH 同源反代，iframe 不再直连回环
     - Verify: 关掉 `--trusted-origins '*'` 后工作台仍可用；WS 连接不 404
     - Depends on: 需先解决「`registerUpgrade` 仅支持 exact path」的冲突；保留 iframe 直连兜底
     - Note: 这是 S2 里唯一标注了明确技术障碍的项，动手前必须先做可行性验证
 
-- [ ] **P3-3 Tab 补全** · 8–15 人日 · 来源 S1
+- [x] **P3-3 Tab 补全** · 8–15 人日 · 来源 S1
+    - **本轮交付核心链路**（默认关闭，需显式开启）：
+      - 后端：`POST /editor-completion`，直连 DSH `llm` 服务（`prepareCall`），
+        **不走 sessionController**——那条路径要过会话/工具/权限/事件广播，秒级延迟
+      - 前端：`registerInlineCompletionItemProvider`，含 debounce(120ms) +
+        最小间隔(400ms) + 取消（`token.isCancellationRequested` + 自增序号）
+      - 预算：前文 4000 字符 / 后文 1000 / `maxTokens: 80` / 硬超时 1.5s
+      - 清洗：去代码块围栏、去重复前缀尾巴、截掉光标后内容
+        （不做的话模型常把整个文件重抄，用户按 Tab 会插入大段重复）
+    - **修复的关键缺陷**：`AbortController` 只能「请求取消」，若适配器不响应
+      （网络挂起），`await prepareCall` 永不返回 → 补全请求永不结束。
+      加了 `Promise.race` 硬超时兜底。
+    - 失败一律静默：补全报错弹窗会打断打字，比没有补全更糟
+    - 默认关闭原因：补全会持续调用模型（成本 + 延迟），应由用户显式开启
+    - Verify: `test/completion.test.mjs`（清洗/预算/静默/超时/空前缀）
+    - 未做：多候选、缓存命中率、按语言调参
     - Paths: `extension.js`（`registerInlineCompletionItemProvider`）、`sessions.js`（新增低延迟端点）
     - Done when: 行内 ghost text 补全，含 debounce / 取消 / 上下文预算 / 缓存
     - Verify: 在编辑器里打字百毫秒级出现建议，Tab 接受、Esc 取消；不影响主会话流
@@ -114,21 +177,64 @@
 
 ## E 长尾（P4）
 
-- [ ] **P4-1 codebase 语义检索** · 10–20 人日（关键词版 2–3 人日）· 来源 S1
+- [x] **P4-1 codebase 语义检索** · 10–20 人日（关键词版）· 来源 S1
+    - **按清单要求只做关键词版**，语义版等需求确认。实现：
+      `POST /editor-search` + `searchCode()`，用 DSH 自带 rg 做字面量检索。
+    - 安全边界（验收标准「不把用户代码传到第三方」）：
+      - 纯本地子进程，结果不落盘、不上传
+      - `spawn` 传参数组、不经 shell → 无命令注入面
+      - rg 的 cwd 就是 root，不接受任意路径参数
+      - `--fixed-strings`：用户输入当字面量，搜 `foo(` 不会变成正则报错
+    - **实测踩到的坑**：原以为 rg 默认跳过 node_modules / .gitignore，实际不会——
+      它的 ignore 规则依赖 `.git` 上下文，非 git 仓库照样搜进依赖目录。
+      修复：显式 `--glob '!node_modules/**'` 等排除 + `--no-require-git`
+      （让无 `.git` 的工作区也遵守用户的 `.gitignore`）。
+    - Verify: `test/search.test.mjs`（真跑 rg；含「没有 .gitignore 的仓库」场景）
+    - 未做：语义检索、符号索引、增量缓存
     - Paths: `sessions.js`、`extension.js`（工具注册）
     - Done when: 先做本地关键词检索版（复用 DSH `grep`/`glob`），语义版等需求确认
     - Verify: Agent 能检索项目内符号；**不把用户代码传到第三方**
     - Depends on: P3-3 的低延迟链路可选复用；本地索引方案需调研
     - Note: Cursor 在云端、CodeBuddy 在本地 `codenexus`；本项目倾向本地
 
-- [ ] **P4-2 MCP 接入** · 5–8 人日 · 来源 S1
+- [x] **P4-2 MCP 接入** · 5–8 人日 · 来源 S1
+    - **调研结论：MCP 能力已由平台自动提供，无需另写客户端**
+      1. `@deepseek-ai/dsh-mcp-resources` 在 **`dsh-base/cordis.patch.yml:492`** 组合，
+         是所有模式的底座，不是某个模式专属。
+      2. 它注册了 `list_mcp_resources` / `list_mcp_resource_templates` /
+         `read_mcp_resource` 三个工具，并通过 `ctx.inject(['systemPrompt'])` 注入
+         「MCP resource servers」段落，把已配置的 server 名告诉模型。
+      3. 侧栏 Chat 与 Agents 是**同一个 sessionController 会话**（双模式 X），
+         所以这些工具在侧栏里本来就可用。本机 `~/.dsh/cordis.patch.yml` 也已配置
+         了迁移自 Claude Code 的 MCP server。
+    - **本次实际交付的是「可见性」**：MCP 工具在会话里以普通 tool 卡片出现，
+      但用户看不出它来自外部服务。新增 `parseMcpTool()` 解析
+      `mcp__<server>__<tool>`，卡片上标注 `MCP · <服务名>`。
+      理由：用户不该在不知情的情况下让代码/数据流向第三方服务。
+    - Verify: `test/mcp.test.mjs`（解析边界 + 前后端展示契约）+ `tab-history-ui`
+      的渲染断言
+    - 未做：MCP 资源浏览面板、按 server 过滤
     - Paths: `extension.js`、`package.json`
     - Done when: 编辑器 Chat 能接入 DSH 已有 MCP 资源服务
     - Verify: 通过 MCP 读一个外部资源并在会话里体现
     - Depends on: 无硬依赖，但 DSH 已支持 MCP，优先级可一直压后
     - Note: S1 原文「会打破纯对话边界」已过时——Chat 本就是 Agent
 
-- [ ] **P4-3 NES（下一处编辑预测）** · 8–12 人日 · 来源 S1
+- [x] **P4-3 NES（下一处编辑预测）** · 8–12 人日 · 来源 S1
+    - 复用 P3-3 的低延迟链路（同一 llm 服务 / 预算 / 超时 / 静默失败），
+      只是问的问题不同：补全问「这里写什么」，NES 问「接着改哪里」。
+    - 后端 `POST /editor-next-edit` → `requestNextEdit()`；
+      扩展命令 `dshEditorBridge.nextEdit`，快捷键 `Shift+Alt+N`，默认关闭。
+    - **交互刻意做轻**：只提状态栏 + 询问「跳转过去」，不强制跳转。
+      NES 是猜测，猜错时强行打断比不提更烦人。
+    - 输出强制结构化（`<行号>` 或 `NONE`），`parseNextEdit()` 做容错：
+      容忍反引号/中文/`file:line`，**拒绝越界行号**（会让编辑器跳到文件外）。
+    - **修掉两个真实缺陷**：
+      1. 负号被忽略：`-5` 被读成第 5 行 → 判无效
+      2. 超时定时器加了 `unref()`，测试进程里无其它任务时**定时器不触发**，
+         请求永不返回 → 去掉 unref（补全侧同类问题一并修复）
+    - Verify: `test/nes.test.mjs`（解析容错 / 越界 / NONE / 超时 / 静默）
+    - 未做：编辑后自动触发、多候选、跨文件预测
     - Paths: `extension.js`（`nes.*` 命令族）
     - Done when: 预测并提示下一处可编辑位置
     - Verify: 改完一段代码后出现 NES 提示且可跳转
@@ -147,6 +253,6 @@
 
 ## 进度
 
-- 待办：7 项（P1×1、P3×3、P4×3）
-- 已完成：7 项（P0-1、P1-2、P1-3、P2-1、P2-2、P2-3、P2-4）
+- 待办：1 项（P3-2 验证受阻）
+- 已完成：13 项（P0-1、P1-1、P1-2、P1-3、P2-1、P2-2、P2-3、P2-4、P3-1、P3-3、P4-1、P4-2、P4-3）
 - 明确不做：4 项（已勾选，仅作记录）

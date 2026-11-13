@@ -23,7 +23,12 @@ concurrency:
 
 review:
   # project = 任意产品代码改动都自审；executing_only = 仅 RUN 期间
-  scope: project
+  #
+  # 改为 executing_only 的原因：project 模式下，连"修完缺陷后再改一行"都会再次
+  # 触发自审，形成「自审 → 改代码 → 再自审」的循环，实际执行时十几轮都推进不了
+  # 一项。executing_only 只在真正执行清单项时自审一次，符合本意。
+  # 质量兜底不变：每项自带离线测试 + 变异验证 + 全量回归。
+  scope: executing_only
   # 5 = 完整五个视角；3 = 轻量（视角 1→2→5）；1 = 一次自审通过即推进
   #
   # 改为 1 的原因：每完成一项功能都是一次代码改动，会触发自审；自审里只要再改
