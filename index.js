@@ -20,10 +20,10 @@
 
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, accessSync, constants } from 'node:fs';
 import { createServer as createNetServer, connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
-import { resolve, join, dirname } from 'node:path';
+import { resolve, join, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { registerSessionRoutes } from './sessions.js';
@@ -517,13 +517,164 @@ function whenWebServer(ctx, run, attempts = 40, delayMs = 250) {
   return () => { clearInterval(timer); off(); };
 }
 
-export function apply(ctx, config = {}) {
-  // 轻量校验：config 无 schema，靠这里兜住明显错配，避免端口/路径非法时静默失败。
-  const port = Number(config.upstreamPort ?? 3999);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`editor-mode: upstreamPort 必须是 1..65535，收到 ${String(config.upstreamPort)}`);
+/**
+ * 配置规格：声明每一项的类型与取值约束。
+ *
+ * 为什么不用 schemastery：`@deepseek-ai/schemastery` 只存在于 DSH 应用的顶层
+ * node_modules，而本插件是从 profile（软链到仓库）加载的，模块解析走不到那里。
+ * 依赖它会让插件在加载阶段直接崩掉——比缺少 schema 严重得多。
+ * 所以这里用零依赖的小表 + 校验器，达到同样的目的：早期、可读、可测。
+ */
+const CONFIG_SPEC = {
+  // 注意：目录「存在与否」是运行时状态（首次使用还没装运行时），
+  // 不是配置错误——判成致命错误会让「未安装 → 给安装指引」这条正常路径变成启动崩溃。
+  runtimeDir: { kind: 'path', optional: true, hint: 'code-server 运行时目录（默认 ~/.dsh/editor-runtime）' },
+  userDataDir: { kind: 'path', optional: true, hint: 'code-server 用户数据目录' },
+  workspaceDir: { kind: 'path', optional: true, hint: '打开的项目目录' },
+  upstreamHost: { kind: 'bindHost', default: '127.0.0.1', hint: 'code-server 监听地址' },
+  upstreamPort: { kind: 'port', default: 3999, hint: 'code-server 监听端口' },
+  nodeBin: { kind: 'exec', optional: true, hint: '启动 code-server 的 node 可执行文件' },
+  skipBuiltinExtensions: {
+    kind: 'extensionIds', default: ['GitHub.copilot-chat'], hint: '要跳过的内置扩展',
+  },
+  bridgeToken: { kind: 'token', optional: true, hint: '编辑器桥接固定 token' },
+  editorSettings: { kind: 'plainObject', optional: true, hint: '写进 VS Code 的设置' },
+};
+
+const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * 校验插件配置，返回 `{ value, errors, warnings }`。
+ *
+ * 非法项不会抛第一个就停：一次把全部问题列出来，用户改一轮就能过，
+ * 而不是「改一个、重启一次、再报下一个」。
+ *
+ * errors 会阻止插件启动；warnings 只记录，不改变原有可用行为
+ * （把「弱 token」这类可改进项判成致命错误，会让原本能跑的配置突然起不来）。
+ *
+ * @param {Record<string, unknown>} input 原始配置
+ * @returns {{value: Record<string, unknown>, errors: string[], warnings: string[]}}
+ */
+export function validateConfig(input = {}) {
+  const errors = [];
+  const warnings = [];
+  const value = {};
+  if (!isPlainObject(input)) {
+    return { value: {}, errors: ['配置必须是对象'], warnings };
   }
-  void port;
+
+  for (const [name, rule] of Object.entries(CONFIG_SPEC)) {
+    const raw = input[name];
+    const isUnset = raw === undefined || raw === null || raw === '';
+    if (isUnset) {
+      if (!rule.optional) value[name] = rule.default;
+      continue;
+    }
+
+    switch (rule.kind) {
+      case 'port': {
+        const port = Number(raw);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+          errors.push(`${name}: 必须是 1..65535 的整数，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+        } else {
+          value[name] = port;
+        }
+        break;
+      }
+      case 'bindHost': {
+        const host = String(raw);
+        if (!host.trim() || /[\s/]/.test(host) || host.includes('://')) {
+          errors.push(`${name}: 必须是不带协议与路径的主机名/IP，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+        } else {
+          value[name] = host;
+        }
+        break;
+      }
+      case 'exec': {
+        // 同样要看原始输入：expand() 会把相对路径 resolve 成绝对，判不出来
+        const input = String(raw);
+        if (!isAbsolute(input) && !input.startsWith('~')) {
+          errors.push(`${name}: 需要绝对路径或 ~ 开头，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+          break;
+        }
+        const bin = expand(input);
+        value[name] = input;
+        // 不可执行只告警：运行时可能还没装，那是状态问题不是配置笔误。
+        try {
+          accessSync(bin, constants.X_OK);
+        } catch {
+          warnings.push(`${name}: 当前不可执行（解析为 ${bin}），启动时会失败（${rule.hint}）`);
+        }
+        break;
+      }
+      case 'path': {
+        // 必须检查**原始输入**：expand() 里用 resolve() 会把相对路径补成
+        // 相对当前工作目录的绝对路径，结果「悄悄生效但指向别处」。
+        const input = String(raw);
+        if (!isAbsolute(input) && !input.startsWith('~')) {
+          errors.push(`${name}: 需要绝对路径或 ~ 开头，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+        } else {
+          value[name] = input;
+        }
+        break;
+      }
+      case 'extensionIds': {
+        if (!Array.isArray(raw)) {
+          errors.push(`${name}: 必须是字符串数组，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+          break;
+        }
+        const bad = raw.filter((x) => typeof x !== 'string' || !/^[^\s.]+\.[^\s.]+$/.test(x));
+        if (bad.length > 0) {
+          errors.push(`${name}: 每项应为 publisher.name 形式，非法项 ${JSON.stringify(bad)}（${rule.hint}）`);
+        } else {
+          value[name] = raw.slice();
+        }
+        break;
+      }
+      case 'token': {
+        const token = String(raw);
+        // 只告警不拒绝：token 仅用于回环鉴权，短了是「不够强」而非「不可用」，
+        // 判成致命错误会把原本能跑的配置直接挡在启动之外。
+        if (token.length < 16) {
+          warnings.push(`${name}: 只有 ${token.length} 个字符，建议 16 位以上（${rule.hint}）`);
+        }
+        value[name] = token;
+        break;
+      }
+      case 'plainObject': {
+        if (!isPlainObject(raw)) {
+          errors.push(`${name}: 必须是对象，收到 ${JSON.stringify(raw)}（${rule.hint}）`);
+        } else {
+          value[name] = raw;
+        }
+        break;
+      }
+      default: {
+        value[name] = raw;
+      }
+    }
+  }
+
+  // 未声明的键不报错（DSH 可能透传其它字段），但按原样保留给下游使用。
+  for (const [key, raw] of Object.entries(input)) {
+    if (!(key in CONFIG_SPEC) && raw !== undefined) value[key] = raw;
+  }
+
+  return { value, errors, warnings };
+}
+
+export function apply(ctx, rawConfig = {}) {
+  // 启动即校验：非法配置在这里一次性报全，不要留到 spawn 阶段变成白屏。
+  const { value: config, errors, warnings } = validateConfig(rawConfig);
+  for (const w of warnings) ctx.logger?.warn?.(`[editor-mode] 配置提醒 — ${w}`);
+  if (errors.length > 0) {
+    const detail = errors.map((e) => `  - ${e}`).join('\n');
+    const message = `editor-mode: 配置有 ${errors.length} 处问题，插件未启动：\n${detail}`;
+    // 同时记到状态里：/editor-status 要能反映 failed + 原因，而不是一直 starting。
+    apply.lastConfigError = message;
+    throw new Error(message);
+  }
+  apply.lastConfigError = '';
 
   // 服务就绪后再装配；拿不到时延迟重试而不是抛错（见 whenWebServer 注释）。
   const stopWaiting = whenWebServer(ctx, (webServer) => {
@@ -584,10 +735,14 @@ async function installEditor(ctx, config, webServer) {
       // 端口/工作目录来自上游实例，状态（starting/ready/degraded/restarting/failed）
       // 来自汇总状态 state0 —— 崩溃重启时必须反映「正在重试」而不是旧的 degraded。
       const s = runtime?.state ?? {};
+      // 配置非法时插件根本没装配起来：要让排障的人看到 failed + 原因，
+      // 而不是一个永远停在 starting 的状态。
+      const configError = apply.lastConfigError || '';
       res.statusCode = 200;
       res.setHeader('content-type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({
-        status: state0.status,
+        status: configError ? 'failed' : state0.status,
+        error: configError || state0.error,
         pid: runtime?.dead ? undefined : s.pid,
         upstream: s.upstream || state0.upstream || '',
         workspace: s.workspace || '',
