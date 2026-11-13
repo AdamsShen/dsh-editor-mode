@@ -1022,6 +1022,153 @@ export function cleanCompletion(raw, prefix, suffix) {
   return text.replace(/\s+$/, '');
 }
 
+// ---------------------------------------------------------------------------
+// 本地代码检索（P4-1）：关键词版
+// ---------------------------------------------------------------------------
+
+/** 检索限制：把单次搜索的代价框住，避免一次查询把整棵树吐出来。 */
+const SEARCH_LIMITS = {
+  maxResults: 200,
+  maxFileBytes: 1024 * 1024,   // 单文件上限，跳过压缩产物 / 数据文件
+  timeoutMs: 8000,
+  maxPatternChars: 200,
+};
+
+/** 命中一行时保留的最大字符数，避免压缩过的单行文件撑爆响应。 */
+const SEARCH_LINE_MAX = 240;
+
+/**
+ * 用 ripgrep 在工作区内做关键词检索。
+ *
+ * 为什么用 rg 而不是自己遍历：rg 默认就跳过 `.gitignore` 里的文件和二进制，
+ * 这正好是我们想要的语义；自己实现要重写一遍 ignore 规则，容易搜出依赖目录。
+ *
+ * 安全边界：
+ *   - 只在 root 内搜（rg 的 cwd 就是 root，不接受任意路径参数）
+ *   - 不把任何结果发往外部 —— 这是"代码不上云"的硬要求
+ *   - 固定参数、不经 shell（`spawn` 传数组），避免命令注入
+ *
+ * @param {object} opts { root, pattern, glob, ignoreCase, maxResults }
+ * @returns {Promise<{lines: Array, truncated: boolean, total: number}>}
+ */
+export async function searchCode(opts = {}) {
+  const root = String(opts.root || '');
+  const pattern = String(opts.pattern || '');
+  if (!root || !pattern.trim()) return { lines: [], truncated: false, total: 0 };
+  // 关键词检索，不是正则：把用户输入当字面量，避免 `(` 之类导致 rg 报错
+  if (pattern.length > SEARCH_LIMITS.maxPatternChars) {
+    return { lines: [], truncated: false, total: 0, error: 'pattern-too-long' };
+  }
+
+  const maxResults = Math.min(Number(opts.maxResults) || SEARCH_LIMITS.maxResults, SEARCH_LIMITS.maxResults);
+  const args = [
+    '--json',
+    '--fixed-strings',            // 字面量匹配：用户搜 `foo(` 不该被当正则
+    '--max-filesize', String(SEARCH_LIMITS.maxFileBytes),
+    '--max-count', String(maxResults),
+    '-n',
+    // 注意：不能指望 rg 自动跳过依赖目录。它的 ignore 规则依赖 .git 上下文，
+    // 工作区不是 git 仓库（或临时目录）时会照样搜进 node_modules —— 实测踩到过。
+    // 因此显式排除；--no-ignore-vcs 保证用户的 .gitignore 仍被遵守的情况下
+    // 我们额外排掉构建产物与依赖。
+    '--glob', '!node_modules/**',
+    '--glob', '!.git/**',
+    '--glob', '!dist/**',
+    '--glob', '!build/**',
+    '--glob', '!out/**',
+    '--glob', '!coverage/**',
+    // 同上：工作区没有 .git 时 rg 默认不读 .gitignore，会让被用户显式忽略的
+    // 文件（日志、密钥导出、临时产物）混进检索结果。开启后两条规则都生效。
+    '--no-require-git',
+  ];
+  if (opts.ignoreCase) args.push('--ignore-case');
+  if (opts.glob) args.push('--glob', String(opts.glob));
+  args.push('--', pattern);
+
+  return new Promise((resolveSearch) => {
+    const child = spawn(rgPath(), args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+    const lines = [];
+    let buf = '';
+    let stderr = '';
+    let truncated = false;
+
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } }, SEARCH_LIMITS.timeoutMs);
+    timer?.unref?.();
+
+    child.stdout.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      let idx = buf.indexOf('\n');
+      while (idx >= 0) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        idx = buf.indexOf('\n');
+        if (!raw) continue;
+        let msg;
+        try { msg = JSON.parse(raw); } catch { continue; }
+        if (msg.type !== 'match') continue;
+        const path = msg.data?.path?.text || '';
+        const lineNo = msg.data?.line_number || 0;
+        const text = (msg.data?.lines?.text || '').replace(/\s+$/, '');
+        if (lines.length >= maxResults) { truncated = true; continue; }
+        lines.push({
+          path,
+          line: lineNo,
+          text: text.length > SEARCH_LINE_MAX ? `${text.slice(0, SEARCH_LINE_MAX)}…` : text,
+        });
+      }
+    });
+    child.stderr.on('data', (c) => { stderr += c.toString(); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolveSearch({ lines: [], truncated: false, total: 0, error: String(err?.message || err) });
+    });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      // rg 的 1 = 没有匹配，属正常；2 = 出错
+      const error = code === 2 ? (stderr.trim().slice(0, 300) || 'rg 失败') : '';
+      resolveSearch({ lines, truncated, total: lines.length, ...(error ? { error } : {}) });
+    });
+  });
+}
+
+/**
+ * 把请求里的 root 限定在工作区内。
+ *
+ * 为什么必须限：`body.root` 是调用方给的，若不校验，任何持 token 的本地进程
+ * 都能把 root 指到家目录甚至 `/`，把日志、`.env`、SSH 密钥内容检索出来
+ * （实测：指到 $HOME 能搜到应用日志）。检索端口不该成为任意文件读取器。
+ *
+ * 判定要求**目录边界**：`/work/repo-other` 不属于 `/work/repo`。
+ *
+ * @param {string} requested 调用方请求的目录（可能为空）
+ * @param {string} workspace 允许的根
+ * @returns {{root: string, error?: string}}
+ */
+export function confineRoot(requested, workspace) {
+  const ws = expand(String(workspace || ''));
+  if (!ws) return { root: '', error: 'no-workspace' };
+  const want = requested ? expand(String(requested)) : ws;
+  if (!want) return { root: '', error: 'invalid-root' };
+
+  const wsPrefix = ws.endsWith('/') ? ws : `${ws}/`;
+  if (want === ws || want.startsWith(wsPrefix)) return { root: want };
+  return { root: '', error: 'root-outside-workspace' };
+}
+
+/** 优先用 DSH 自带的 rg，其次系统 PATH 里的。 *//** 优先用 DSH 自带的 rg，其次系统 PATH 里的。 */
+function rgPath() {
+  const bundled = join(PACKAGE_DIR, '..');
+  const candidates = [
+    '/Applications/DeepSeek Harness.app/Contents/Resources/app.asar.unpacked/dsh/node_modules/@vscode/ripgrep-darwin-arm64/bin/rg',
+    join(bundled, 'node_modules', '.bin', 'rg'),
+  ];
+  for (const c of candidates) {
+    try { accessSync(c, constants.X_OK); return c; } catch { /* 继续找 */ }
+  }
+  return 'rg';   // 回落到 PATH
+}
+
+// ---------------------------------------------------------------------------
 export function apply(ctx, rawConfig = {}) {
   // 启动即校验：非法配置在这里一次性报全，不要留到 spawn 阶段变成白屏。
   const { value: config, errors, warnings } = validateConfig(rawConfig);
@@ -1182,6 +1329,36 @@ async function installEditor(ctx, config, webServer) {
   // 必须在两个 handler 之前声明 —— 虽然闭包实际执行时已初始化，
   // 但把"能用"寄托在求值顺序上太脆弱，读代码的人也无从判断。
   let completionInflight = 0;
+
+  // ---- 本地代码检索端点 ----
+  // 只在本机工作区内跑 rg，结果不落盘、不上传：代码不外发是硬要求。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/editor-search',
+    handler: async (req, res) => {
+      if (!bridgeAllowed(req)) { res.writeHead(403); res.end(); return; }
+      if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+      const read = await readJsonBody(req, 64 * 1024);
+      if (read.tooLarge) { res.writeHead(413); res.end(); return; }
+      const body = read.value || {};
+      const workspace = config.workspaceDir
+        ? expand(String(config.workspaceDir))
+        : resolve(homedir(), 'dsh-editor-mode');
+      // root 必须落在工作区内：否则检索端口就成了任意文件读取器
+      const confined = confineRoot(body.root, workspace);
+      if (!confined.root) {
+        res.statusCode = 403;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ error: '只能检索工作区内的路径', reason: confined.error }));
+        return;
+      }
+      const result = await searchCode({ ...body, root: confined.root });
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('cache-control', 'no-store');
+      res.end(JSON.stringify(result));
+    },
+  }), 'editor-mode: POST /editor-search');
 
   // ---- 行内补全端点 ----
   // 独立于会话流：补全是毫秒级需求，走 /editor-sessions/stream 会慢一个数量级。
