@@ -8,12 +8,18 @@
 
 ## A 核心闭环（P0）
 
-- [ ] **P0-1 让 AI 改动可被看见（diff 审核）** · 3–5 人日 · 来源 S1
-    - Paths: `extensions/local.dsh-editor-bridge-0.3.0/extension.js`、`media/chat.js`、`media/chat.css`
-    - Done when: Agent 改动文件后，侧栏能列出本轮改动文件，点击可用 `vscode.diff` 打开「改动前 ↔ 改动后」；不自建 restore（复用 DSH rewind 快照）
-    - Verify: 在真实 DSH 里让 Agent 改一个文件，编辑器侧出现 diff 入口且能打开；离线用例覆盖「改动文件列表」的折叠逻辑
-    - Depends on: 先只读探测 DSH rewind 快照的可读性与触发时机
-    - Note: S1 原文说「AI 不能改代码」已过时；改造后 Agent 真的会改文件，这条缺口**更关键**
+- [x] **P0-1 让 AI 改动可被看见（diff 审核）** · 3–5 人日 · 来源 S1
+    - Paths: `sessions.js`、`extensions/local.dsh-editor-bridge-0.3.0/{extension.js,session-view.js,media/chat.js,media/chat.css}`
+    - Done when: Agent 改动文件后，侧栏列出本轮改动文件，点击用原生 `vscode.diff` 打开「改动前 ↔ 改动后」
+    - Verify: 隔离 DSH 实测通过 —— Agent 真改 `demo.txt` 后 `workspace/changes(seq=33)` 到达实时流，
+      `summary` 返回 1 个文件 +1/−1，`diff` 返回真实 hunk，反推的 before 与原始内容逐行一致
+    - Depends on: ~~DSH rewind 快照~~ → **已修正为 `ctx.workspaceChanges` 服务**
+    - Note: 原 `Depends on` 方向有误。实测 `dsh-rewind-plugin` 只导出 Config/SnapshotStore/apply，
+      未注册可供外部插件调用的服务，对外只有面向 Client UI 的两个路由，**不可复用**。
+      真正可用的是 DSH 自己的 `workspaceChanges`（由 `dsh-web-app` 组成，与 sessionController 同级），
+      `summary()` 给文件列表、`diff()` 给 hunks。且 `diff()` 只回 `before/after` 布尔值不回原文，
+      故「改动前」内容由「磁盘当前内容 + hunks 反推」还原（`invertHunks`）。
+      不做 restore —— DSH 侧已有 rewind 用户入口，不重复造。
 
 ---
 
@@ -25,44 +31,56 @@
     - Verify: 引用一个未打开的文件提问，Agent 能读到其内容；预算上限不被突破
     - Depends on: 无
 
-- [ ] **P1-2 更多上下文入口（资源管理器 / 终端右键）** · 0.5–1 人日 · 来源 S1
-    - Paths: `package.json`（`contributes.menus`）、`extension.js`
-    - Done when: 新增 `explorer/context` 与终端选区命令，把文件/选区送入当前会话
-    - Verify: 在资源管理器和终端右键能看到并成功触发；`test/webview-wiring.test.mjs` 仍全绿
-    - Depends on: 无
+- [x] **P1-2 更多上下文入口（资源管理器 / 终端右键）** · 0.5–1 人日 · 来源 S1
+    - Paths: `package.json`（commands/menus/activationEvents）、`extension.js`
+    - Done when: 新增 `explorer/context`（按文件/目录分派、支持多选）与 `terminal/context` 三个命令
+    - Verify: 菜单声明与 `registerCommand` 成对（静态断言覆盖）；终端读不到选区时给明确提示
+    - Note: 只送 `@路径` 不送文件内容——Chat 是真实 Agent，自己会读文件，塞正文会浪费上下文预算
+    - Note: 终端选区无公开 API，走 `workbench.action.terminal.copySelection` + 剪贴板，
+      命令或剪贴板不可用时降级为提示
 
-- [ ] **P1-3 项目规则文件注入** · 1 人日 · 来源 S1
-    - Paths: `sessions.js` 或 `index.js`（Host 侧组装上下文处）
-    - Done when: 发消息时读取项目根 `AGENTS.md` 并按 DSH 既有优先级注入；Chat 能遵守本项目约定
-    - Verify: 在 `AGENTS.md` 写一条明确规则，提问验证 Agent 遵守
-    - Depends on: 需先按项目 skill 调研业内规则文件约定（`.cursor/rules` / `CODEBUDDY.md` / `AGENTS.md`）
-    - Note: 收益/成本比最高，建议排在 P1 最前
+- [x] **P1-3 项目规则文件注入** · 1 人日 · 来源 S1
+    - **调研结论（2026-11-13）**：DSH 的 `agent-instructions` 模块**已经原生加载**
+      `AGENTS.md` / `CLAUDE.md`（含 `.local` 覆盖，按 `.git` 标记向上查找），
+      且已组合进默认栈（`dsh-web-app/cordis.patch.yml:577`、`dsh-base/cordis.patch.yml`）。
+      侧栏 Chat 是同一套 sessionController + cwd，因此**规则自动生效，无需我们注入**。
+      自己再拼一份只会重复注入并打乱「项目 > 全局」的优先级。
+    - Done when: 平台读不到的旧约定（`.cursorrules`、`.cursor/rules/*.mdc`、
+      `.github/copilot-instructions.md`、`CODEBUDDY.md`）可一键导入 `AGENTS.md`
+    - 实现: 新增命令 `dshEditorBridge.importRules`；只追加不覆盖、带 `<!-- dsh-import: ... -->`
+      标记，重复执行幂等；已导入来源即使内容更新也不重写（避免覆盖用户手改）
+    - Verify: `test/rules-import.test.mjs`（四种来源识别、保留既有内容、幂等、无文件提示）
+    - Note: 原计划「Host 侧组装上下文注入」被否——那是重复实现平台能力
 
 ---
 
 ## C 正确性欠账（P2，均为改造后遗留，建议先做）
 
-- [ ] **P2-1 修复联调测试 `integration-chat.live.mjs`** · 0.5 人日 · 来源 S4
+- [x] **P2-1 修复联调测试 `integration-chat.live.mjs`** · 0.5 人日 · 来源 S4
     - Paths: `test/integration-chat.live.mjs`
-    - Done when: 不再引用已删除的 `/editor-chat/{send,models,abort}`，改为走 `/editor-sessions/{create,prompt,stream}` 验证真实会话链路
-    - Verify: `node test/integration-chat.live.mjs` 在 DSH 运行时通过（或按设计明确跳过）
-    - Depends on: 无
-    - Note: 改造时只更新了 9 个离线用例，这个 live 测试被漏掉了；当前它跑不通
+    - Done when: 不再引用已删除的 `/editor-chat/*`，改为走 `/editor-sessions/*` 验证真实会话链路
+    - Verify: 探活用 `/editor-sessions/list`；「无 bridge.json / 端点不可达」时输出 SKIP 并 exit 0（已实测）
+    - Note: 不只是换端点——旧用例断言的是 `models`/`delta`/`message.content`，
+      新协议已改为 `sessionId`/parts/`append`，故整体按新协议重写
 
-- [ ] **P2-2 README 纠偏** · 0.3 人日 · 来源 S3
-    - Paths: `README.md:197`（「侧栏 Chat 不带工具、不共享 DSH 会话历史」）、`README.md:210`（「8 个用例」）
-    - Done when: 改为「就是 DSH 真实 Agent 会话的第二个视图」与「9 个用例」；能力表与实际交互（tab 条 / 历史覆盖层 / 工具卡片）一致
-    - Verify: 通读 README 无与 `package.json`、`extension.js` 矛盾的描述
-    - Depends on: 无
+- [x] **P2-2 README 纠偏** · 0.3 人日 · 来源 S3
+    - Paths: `README.md`（已知边界段 + 测试用例数）
+    - Done when: 「侧栏 Chat 不带工具」改为「就是 DSH 真实 Agent 会话的第二个视图」；用例数改为 12
+    - Verify: `grep` 全文无「不带工具、不共享」与旧用例数（已验，0 残留）
 
-- [ ] **P2-3 更新 `docs/research/gap-todo.md`** · 0.5 人日 · 来源 S1
+- [x] **P2-3 更新 `docs/research/gap-todo.md`** · 0.5 人日 · 来源 S1
     - Paths: `docs/research/gap-todo.md`
-    - Done when: 修正「纯模型对话 / AI 不能改代码 / MCP 会打破边界」等过时结论；「已完成」的多会话与历史条目从待办移出；与 `checklist.md` 交叉引用
-    - Verify: 该文档与 `cursor-codebuddy-editor-implementation.md` 的证据链仍自洽，不删原始调研记录
-    - Depends on: 无
+    - Done when: 顶部加时效声明；「一句话结论」与 MCP 段落标注失效并给出当前结论；指向 checklist 作为权威进度
+    - Verify: 保留原始调研记录（用删除线+注解，不删原文）；失效结论处均有 ⚠️ 标注
 
-- [ ] **P2-4 补 Config schema 与参数校验** · 1–2 人日 · 来源 S2、S5
-    - Paths: `index.js`（`apply`）、`cordis.patch.yml`
+- [x] **P2-4 补 Config schema 与参数校验** · 1–2 人日 · 来源 S2、S5
+    - **不用 schemastery 的原因**：`@deepseek-ai/schemastery` 只在 DSH 应用顶层
+      node_modules，本插件从 profile（软链仓库）加载，解析不到；直接 import 会让插件
+      加载即崩，比缺 schema 严重。改用零依赖的 `CONFIG_SPEC` + `validateConfig()`。
+    - 关键判断：**「目录不存在 / 二进制不可执行」是运行时状态，不是配置错误**——
+      判成致命错误会让「运行时未安装 → 给安装指引」这条正常路径变成启动崩溃
+      （`host-restart.test.mjs` 当时就是这么暴露的）。这类只告警。
+    - Paths: `index.js`（`CONFIG_SPEC` / `validateConfig` / `apply` / `/editor-status`）
     - Done when: 用 schemastery / z 声明 `runtimeDir` / `upstreamHost` / `upstreamPort` / `nodeBin` / `workspaceDir` / `skipBuiltinExtensions` / `bridgeToken` 的类型与取值约束；非法配置在启动时给出明确错误而不是白屏
     - Verify: 传一个越界端口与非法 `nodeBin`，插件报出可读错误且 `/editor-status` 显示 `failed`；`npm test` 全绿
     - Depends on: 建议排在 P3-1 之前
@@ -129,6 +147,6 @@
 
 ## 进度
 
-- 待办：14 项（P0×1、P1×3、P2×4、P3×3、P4×3）
-- 已完成：0 项
+- 待办：7 项（P1×1、P3×3、P4×3）
+- 已完成：7 项（P0-1、P1-2、P1-3、P2-1、P2-2、P2-3、P2-4）
 - 明确不做：4 项（已勾选，仅作记录）

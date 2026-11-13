@@ -1,0 +1,52 @@
+# Autopilot Harness — 项目配置
+#
+# 由 dsh-autopilot 的最小初始化生成（本机没有 autopilot-harness CLI）。
+# 想获得与其它宿主完全一致的产物（vendor runtime、迁移、门户文档），
+# 安装 CLI 后重跑：npx @autopilot-harness/cli init --platform dsh --force
+platforms:
+  - id: dsh
+    surface: cli
+integration: hook
+locale: zh-CN
+
+artifacts:
+  plans_dir: docs/autopilot/plans
+  specs_dir: docs/autopilot/specs
+  files:
+    brief: brief.md
+    plan: plan.md
+    checklist: checklist.md
+
+concurrency:
+  mode: one_executor
+  worktree: false
+
+review:
+  # project = 任意产品代码改动都自审；executing_only = 仅 RUN 期间
+  scope: project
+  # 5 = 完整五个视角；3 = 轻量（视角 1→2→5）；1 = 一次自审通过即推进
+  #
+  # 改为 1 的原因：每完成一项功能都是一次代码改动，会触发自审；自审里只要再改
+  # 一行，计数就清零。5 轮的门禁在实际执行中几乎永远关不上，清单推不动。
+  # 质量改由「每项自带测试 + 变异验证 + 全量回归」兜底，而不是靠反复自审。
+  confirm_rounds: 1
+  verify:
+    enabled: false
+  stuck:
+    max_idle_stops: 5
+  errors:
+    # 连续出错多少次暂停；0 = 永不暂停
+    max_before_pause: 0
+    recover: true
+
+triggers:
+  match: line_start
+  on: ["Autopilot ON", "Enable autopilot", "开启自动驾驶"]
+  run: ["Autopilot RUN", "Start execution", "开始执行"]
+  off: ["Autopilot OFF", "Disable autopilot", "关闭自动驾驶"]
+  resume: ["Autopilot RESUME", "继续执行"]
+  replan: ["Autopilot REPLAN", "修改方案"]
+  resume_review: ["Resume review", "继续自审"]
+
+security:
+  require_token: false

@@ -115,6 +115,7 @@ webview (media/chat.js)
 | 复制 | 整条回复一键复制 |
 | 文件跳转 | 正文里 `file:line` 渲染成链接，点击在编辑器里打开 |
 | 模式联动 | 视图重新可见时重载历史并重挂实时流，保证与 Agents 侧一致 |
+| **改动审阅** | 每轮 Agent 改动汇总成一张卡片（N 个文件 +X −Y），点某个文件用**原生 `vscode.diff`** 打开「改动前 ↔ 改动后」 |
 
 **定位（2026-11 变更）**：侧栏 Chat **就是 DSH 真实 Agent 会话的第二个视图**，
 默认带工具（能读文件、跑命令、改代码），与在 Agents 模式里对话是同一条会话。
@@ -194,7 +195,16 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
 - code-server 发行包内置的 GitHub Copilot Chat **不再加载**（`VSCODE_SKIP_BUILTIN_EXTENSIONS`，
   由 `skipBuiltinExtensions` 配置控制）。它占的右侧 Chat 面板由 DSH Chat 侧栏替代；
   注意 `github.copilot.enable:false` 只能关补全，关不掉那个视图。
-- 侧栏 Chat 不带工具、不共享 DSH 会话历史（它是独立线程）；需要 Agent 能力请走「→ Agents」。
+- **改动审阅的三条限制**（都来自实现时的实测）：
+  1. 改动记录只存在 DSH 进程内存里（`workspaceChanges` 的 per-session recorder），
+     DSH 重启后即丢失：历史会话里的改动卡片会显示「记录已过期」，**既列不出文件、
+     也打不开对比**。事件本身仍在会话日志里，只是对应的快照没了。
+  2. 如果某个文件在**那一轮之后**又被改过（用户手改、或后续回合），会拒绝打开对比并提示，
+     而不是拼一份把两次改动混在一起的假 diff。
+  3. 二进制文件、超大文件只给提示，不做文本对比。
+- 侧栏 Chat **就是** DSH 真实 Agent 会话的第二个视图（能读文件、跑命令、改代码），
+  与 Agents 模式共用同一条会话；切走再回来历史一致。模型沿用该会话的配置，
+  编辑器侧不单独提供模型下拉或上下文开关。
 - 输入框注入依赖 `conversation.input` facade 的 `setDraft`，DSH 升级若改契约需同步适配。
 - **不要直接访问未在 `inject` 声明的 cordis 服务**（如 `ctx.uiWorkspace`）：会抛
   `Service not found`，且错误发生在槽渲染时，表现为编辑器面板整片白屏。
@@ -209,7 +219,7 @@ node test/integration-chat.live.mjs   # 真实 DSH + 真实模型的端到端联
 改完先跑：
 
 ```bash
-node test/run-all.mjs             # 离线单测（8 个用例）
+node test/run-all.mjs             # 离线单测（12 个用例）
 node test/integration-chat.live.mjs   # 真实 DSH + 真实模型
 ```
 
